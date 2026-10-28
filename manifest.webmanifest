@@ -8,10 +8,10 @@
   "display": "standalone",
   "orientation": "any",
   "background_color": "#F7F8FC",
-  "theme_color": "#F7F8FC",
+  "theme_color": "#000A4F",
   "user_preferences": {
     "color_scheme_dark": {
-      "theme_color": "#0E1024",
+      "theme_color": "#000A4F",
       "background_color": "#0E1024"
     }
   },
