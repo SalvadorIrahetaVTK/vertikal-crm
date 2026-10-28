@@ -336,7 +336,7 @@ function viewInbox() {
 }
 
 // ---------------------------------------------------------------- RECURRENTES
-function viewRecurring() {
+function viewRecurringOld() {
   const list = S.alive(store.state.recurring).sort((a, b) => S.clientName(a.clientId).localeCompare(S.clientName(b.clientId)) || a.title.localeCompare(b.title));
   const nx = S.nextRecurringRun();
   const gen = Object.keys(store.state.settings.recurringGenerated || {}).sort().reverse();
@@ -512,6 +512,7 @@ function renderSheet() {
       ${t.status === 'done' ? `<button class="btn outlined sm" data-act="toggle" data-id="${t.id}">Reabrir</button>` : `<button class="btn filled sm" data-act="toggle" data-id="${t.id}">${icon('check', 'sm')}Marcar terminada</button>`}
       ${t.status !== 'progress' && t.status !== 'done' ? `<button class="btn tonal sm" data-act="set-status" data-v="progress" data-id="${t.id}">${icon('play', 'sm')}Iniciar</button>` : ''}
       <button class="btn outlined sm" data-act="meet-new" data-id="${t.id}">${icon('video', 'sm')}Agendar reunión</button>
+      <button class="btn outlined sm" data-act="repeat" data-id="${t.id}">${icon('repeat', 'sm')}Repetir…</button>
       <button class="btn outlined sm" data-act="dup" data-id="${t.id}">${icon('copy', 'sm')}Duplicar</button>
       <button class="btn danger sm" data-act="del" data-id="${t.id}">${icon('trash', 'sm')}Eliminar</button>
     </div>
@@ -591,7 +592,7 @@ function clientDialog(c) {
   });
 }
 
-function recurringDialog(r) {
+function recurringDialogOld(r) {
   const isNew = !r; r = r || { id: uid(), title: '', clientId: '', categoryId: '', priority: 'normal', days: [], time: '', notes: '', active: true };
   let days = [...r.days];
   dialog(`${dlgHead(isNew ? 'Nueva tarea recurrente' : 'Editar recurrente', 'repeat')}
@@ -710,6 +711,7 @@ const rowMenu = (el, id) => {
     { label: 'Iniciar (En desarrollo)', icon: 'play', run: () => { S.updateTask(id, { status: 'progress' }); commit(); } },
     { label: 'Mover a mañana', icon: 'calendar', run: () => { S.updateTask(id, { dueDate: ymd(addDays(new Date(), 1)) }); commit(); snack('Movida a mañana'); } },
     { label: 'Agendar reunión', icon: 'video', run: () => meetDialog(id) },
+    { label: 'Repetir…', icon: 'repeat', run: () => repeatFromTask(id) },
     { label: 'Duplicar', icon: 'copy', run: () => { const n = S.duplicateTask(id); commit(); snack(`Duplicada como ${n.code}`); } },
     { label: 'Enviar al Inbox', icon: 'inbox', run: () => { S.updateTask(id, { status: 'inbox' }); commit(); } },
     '-',
@@ -1521,6 +1523,216 @@ document.addEventListener('input', debounce(e => {
 
 
 // ---------------------------------------------------------------- arranque
+
+// ================================================================ v3: recurrentes con documentos y repetición diaria/semanal
+const WD = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
+const WD_L = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'];
+function recSummary(r) {
+  const f = S.recFreq(r);
+  let s = f === 'daily' ? (r.dailyMode === 'weekdays' ? 'Diaria · lunes a viernes' : 'Diaria · todos los días')
+    : f === 'weekly' ? 'Semanal · ' + (r.weekdays || []).slice().sort().map(d => WD_L[d - 1]).join(', ')
+    : `Mensual · ${(r.days || []).length}× al mes`;
+  if (r.start && r.start > todayStr()) s += ` · desde ${absDate(r.start)}`;
+  if (r.end) s += ` · hasta ${absDate(r.end)}`;
+  return s;
+}
+function recChips(r) {
+  const f = S.recFreq(r);
+  if (f === 'daily') return `<span>${r.dailyMode === 'weekdays' ? 'L a V' : 'Todos'}</span>`;
+  if (f === 'weekly') return (r.weekdays || []).slice().sort().map(d => `<span>${WD[d - 1]}</span>`).join('');
+  return (r.days || []).map(d => `<span>${d === 'L' ? 'Últ.' : d}</span>`).join('');
+}
+
+function viewRecurring() {
+  const list = S.alive(store.state.recurring).sort((a, b) => (S.recIsOver(a) - S.recIsOver(b)) || S.clientName(a.clientId).localeCompare(S.clientName(b.clientId)) || a.title.localeCompare(b.title));
+  const nx = S.nextRecurringRun();
+  const monthly = list.filter(r => r.active && S.recFreq(r) === 'monthly' && !S.recIsOver(r));
+  const perMonth = monthly.reduce((a, r) => a + (r.days || []).length, 0);
+  const gen = Object.keys(store.state.settings.recurringGenerated || {}).sort().reverse();
+  const cur = ym(new Date());
+  return `
+  <div class="banner">${icon('repeat')}<div class="t"><b>Mensuales: próxima generación el ${fmtLongDate(nx.date)}</b><span>El último día de cada mes se crean las tareas de ${S.monthLabel(nx.month)} (${perMonth} tareas de ${monthly.length} plantillas). Las diarias y semanales se crean solas con ${S.ROLL_DAYS} días de anticipación.</span></div>
+    <select class="select mini" id="genMonth" style="width:auto;background-color:#fff;color:#000A4F">${[0, 1, 2].map(i => monthAdd(cur, i)).map(m => opt(m, S.monthLabel(m) + (store.state.settings.recurringGenerated?.[m] ? ' ✓' : ''), nx.month)).join('')}</select>
+    <button class="btn filled sm" data-act="rec-gen" style="background:#fff;color:#000A4F">Generar mensuales</button></div>
+  <div class="toolbar"><span class="muted small">Meses generados: ${gen.map(m => S.monthLabel(m).slice(0, 3) + ' ' + m.slice(0, 4)).join(', ') || 'ninguno'}</span><span class="sp"></span><button class="btn filled" data-act="rec-new">${icon('plus', 'sm')}Nueva recurrente</button></div>
+  <div class="card" style="padding:6px 8px">
+    <div class="rec-row thead"><span>Activa</span><span>Tarea</span><span class="r-hide">Cliente</span><span class="r-hide">Categoría</span><span class="r-hide">Repetición</span><span class="r-hide">Hora</span><span></span></div>
+    ${list.map(r => {
+      const over = S.recIsOver(r); const nAtt = (r.links || []).length + (r.files || []).length; const nSub = (r.subtasks || []).length;
+      return `<div class="rec-row ${r.active && !over ? '' : 'off'}">
+      <button class="switch ${r.active ? 'on' : ''}" data-act="rec-toggle" data-id="${r.id}" aria-label="Activar"></button>
+      <div style="min-width:0"><b style="font-weight:600">${esc(r.title)}</b>${over ? ' <span class="tag">Finalizada</span>' : ''}
+        <div class="small muted" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${esc(recSummary(r))}${r.priority === 'high' ? ' · Alta' : ''}${nAtt ? `<span class="meta-icons">${icon('attach', 'xs')}${nAtt}</span>` : ''}${nSub ? `<span class="meta-icons">${icon('subtask', 'xs')}${nSub}</span>` : ''}</div></div>
+      <span class="r-hide">${clientChip(r.clientId)}</span>
+      <span class="r-hide"><span class="tag">${esc(S.categoryName(r.categoryId) || '—')}</span></span>
+      <span class="r-hide daychips">${recChips(r)}</span>
+      <span class="r-hide small">${r.time ? fmtHM(r.time) : '—'}</span>
+      <div style="display:flex;gap:2px;justify-content:flex-end"><button class="icon-btn sm" data-act="rec-edit" data-id="${r.id}" title="Editar">${icon('edit', 'sm')}</button><button class="icon-btn sm" data-act="rec-more" data-id="${r.id}" title="Más">${icon('more', 'sm')}</button></div>
+    </div>`;
+    }).join('') || emptyBox('Sin tareas recurrentes', 'repeat', true)}
+  </div>`;
+}
+
+function recurringDialog(r, preset = null) {
+  const isNew = !r;
+  const d = {
+    id: uid(), title: '', clientId: '', categoryId: '', priority: 'normal', time: '', notes: '', active: true,
+    freq: 'monthly', days: [], weekdays: [], dailyMode: 'weekdays', start: todayStr(), end: '', links: [], files: [], subtasks: [],
+    ...(r ? structuredClone(r) : {}), ...(preset || {})
+  };
+  if (r && !r.freq) d.freq = 'monthly';
+  d.links ||= []; d.files ||= []; d.subtasks ||= []; d.days ||= []; d.weekdays ||= [];
+  const form = dialog(`${dlgHead(isNew ? (preset ? 'Repetir tarea' : 'Nueva tarea recurrente') : 'Editar recurrente', 'repeat')}
+  <div class="dlg-b">
+    <label class="field"><span>Tarea</span><input class="input" name="title" required autofocus value="${esc(d.title)}"></label>
+    <div class="row2">
+      <label class="field"><span>Cliente</span><select class="select" name="clientId">${clientOptions(d.clientId)}</select></label>
+      <label class="field"><span>Categoría</span><select class="select" name="categoryId">${catOptions(d.categoryId)}</select></label>
+    </div>
+    <div class="row2">
+      <label class="field"><span>Prioridad</span><select class="select" name="priority">${prioOptions(d.priority)}</select></label>
+      <label class="field"><span>Hora límite (opcional)</span><input class="input" type="time" name="time" value="${esc(d.time)}"></label>
+    </div>
+    <div class="section-title" style="margin-top:4px">Repetición<span class="sp"></span></div>
+    <div class="seg" id="recFreq">${[['daily', 'Diaria'], ['weekly', 'Semanal'], ['monthly', 'Mensual']].map(([k, l]) => `<button type="button" data-f="${k}">${l}</button>`).join('')}</div>
+    <div id="recSched"></div>
+    <div class="row2">
+      <label class="field"><span>Desde</span><input class="input" type="date" name="start" value="${esc(d.start || '')}"></label>
+      <label class="field"><span>Hasta (opcional)</span><input class="input" type="date" name="end" value="${esc(d.end || '')}"></label>
+    </div>
+    <div class="small muted" id="recPreview"></div>
+    <div class="section-title">Notas<span class="sp"></span></div>
+    <textarea class="textarea" name="notes" style="min-height:56px" placeholder="Instrucciones que se copiarán en cada tarea">${esc(d.notes)}</textarea>
+    <div class="section-title">Subtareas<span class="sp"></span></div>
+    <div id="recSubs"></div>
+    <div class="add-row"><input class="input mini" id="recSubIn" placeholder="Agregar subtarea y presionar Enter"><button type="button" class="btn tonal sm" id="recSubAdd">${icon('plus', 'sm')}</button></div>
+    <div class="section-title">Enlaces · Docs, Sheets, Slides, PDF, carpetas<span class="sp"></span></div>
+    <div id="recLinks"></div>
+    <div class="add-row"><input class="input mini" id="recLinkIn" type="url" placeholder="Pega un enlace (calendario de contenido, tabla, documento…)"><button type="button" class="btn tonal sm" id="recLinkAdd">${icon('link', 'sm')}Enlazar</button></div>
+    <div class="section-title">Archivos<span class="sp"></span></div>
+    <div id="recFiles"></div>
+    <button type="button" class="btn outlined sm" id="recFileBtn" style="justify-self:start">${icon('upload', 'sm')}Subir archivo a Drive</button>
+    <input type="file" id="recFileIn" multiple hidden>
+  </div>${dlgFoot(isNew ? 'Guardar y activar' : 'Guardar')}`, fd => {
+    const f = d.freq;
+    if (f === 'monthly' && !d.days.length) { snack('Selecciona al menos un día del mes'); return false; }
+    if (f === 'weekly' && !d.weekdays.length) { snack('Selecciona al menos un día de la semana'); return false; }
+    if (fd.end && fd.start && fd.end < fd.start) { snack('La fecha “Hasta” debe ser posterior a “Desde”'); return false; }
+    const saved = { ...d, title: fd.title.trim(), clientId: fd.clientId || null, categoryId: fd.categoryId || null, priority: fd.priority, time: fd.time, notes: fd.notes, start: fd.start || '', end: fd.end || '',
+      days: d.days.slice().sort((a, b) => (a === 'L' ? 99 : a) - (b === 'L' ? 99 : b)), weekdays: d.weekdays.slice().sort() };
+    S.upsert('recurring', saved);
+    let applied = 0;
+    if (!isNew) { const open = S.recOpenTasks(saved.id).length; if (open && confirm(`Hay ${open} tareas pendientes generadas con esta plantilla. ¿Aplicarles también los cambios?`)) applied = S.applyTemplateToOpen(saved); }
+    const n = S.activateTemplate(saved);
+    commit();
+    snack(`${isNew ? 'Recurrente creada' : 'Recurrente actualizada'}${n ? ` · ${n} tarea${n === 1 ? '' : 's'} creada${n === 1 ? '' : 's'}` : ''}${applied ? ` · ${applied} actualizadas` : ''}`);
+  }, { width: 'min(680px, calc(100vw - 24px))' });
+
+  const $f = s => form.querySelector(s);
+  const preview = () => {
+    const start = $f('[name=start]').value || todayStr(); const end = $f('[name=end]').value;
+    const probe = { ...d, start, end };
+    const from = start > todayStr() ? parseYmd(start) : new Date();
+    const out = [];
+    for (let i = 0; i < 400 && out.length < 6; i++) { const ds = ymd(addDays(from, i)); if (end && ds > end) break; if (S.recMatches(probe, ds)) out.push(fmtDate(ds)); }
+    $f('#recPreview').textContent = out.length ? `Próximas: ${out.join(' · ')}${out.length === 6 ? '…' : ''}` : 'No hay fechas en este rango.';
+  };
+  const sched = () => {
+    form.querySelectorAll('#recFreq [data-f]').forEach(b => b.classList.toggle('on', b.dataset.f === d.freq));
+    const box = $f('#recSched');
+    if (d.freq === 'daily') box.innerHTML = `<div class="seg">${[['weekdays', 'Lunes a viernes'], ['all', 'Todos los días']].map(([k, l]) => `<button type="button" data-dm="${k}" class="${d.dailyMode === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+    else if (d.freq === 'weekly') box.innerHTML = `<div class="field"><span>Días de la semana</span><div class="daypick wk">${WD.map((w, i) => `<button type="button" data-wd="${i + 1}" class="${d.weekdays.includes(i + 1) ? 'on' : ''}" title="${WD_L[i]}">${w}</button>`).join('')}</div></div>`;
+    else box.innerHTML = `<div class="field"><span>Días del mes (una tarea por día marcado)</span><div class="daypick">${[...Array(31)].map((_, i) => `<button type="button" data-day="${i + 1}" class="${d.days.includes(i + 1) ? 'on' : ''}">${i + 1}</button>`).join('')}<button type="button" data-day="L" class="${d.days.includes('L') ? 'on' : ''}" title="Último día del mes">Últ.</button></div></div>`;
+    preview();
+  };
+  const parts = () => {
+    $f('#recSubs').innerHTML = d.subtasks.map(s => `<div class="sub-row"><span class="check" style="cursor:default">${icon('check')}</span><span style="flex:1">${esc(s.title)}</span><button type="button" class="icon-btn sm danger" data-rs="${s.id}" title="Quitar">${icon('trash', 'sm')}</button></div>`).join('') || '<div class="small muted">Sin subtareas</div>';
+    $f('#recLinks').innerHTML = d.links.map(l => `<div class="link-row"><span class="ficon f-${l.type}">${icon(typeIcon(l.type))}</span><div class="lt"><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a><small>${esc(linkInfo(l.url).label)}</small></div><button type="button" class="icon-btn sm danger" data-rl="${l.id}" title="Quitar">${icon('trash', 'sm')}</button></div>`).join('') || '<div class="small muted">Sin enlaces</div>';
+    $f('#recFiles').innerHTML = d.files.map(x => `<div class="link-row"><span class="ficon f-${x.type}">${icon(typeIcon(x.type))}</span><div class="lt"><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.name)}</a><small>${x.size ? fmtSize(x.size) : 'En Drive'}</small></div><button type="button" class="icon-btn sm danger" data-rf="${x.id}" title="Quitar">${icon('trash', 'sm')}</button></div>`).join('') || '<div class="small muted">Sin archivos</div>';
+  };
+  const addSub = () => { const v = $f('#recSubIn').value.trim(); if (!v) return; d.subtasks.push({ id: uid(), title: v }); $f('#recSubIn').value = ''; parts(); $f('#recSubIn').focus(); };
+  const addLink = async () => {
+    const url = $f('#recLinkIn').value.trim(); if (!/^https?:\/\//.test(url)) { snack('Pega un enlace válido (https://…)'); return; }
+    const info = linkInfo(url); const l = { id: uid(), url, title: info.label, type: info.type, addedAt: new Date().toISOString() };
+    d.links.push(l); $f('#recLinkIn').value = ''; parts();
+    if (info.driveId && auth.valid) { try { const m = await driveMeta(info.driveId); l.title = m.name; const mt = mimeToType(m.mimeType); if (mt !== 'file') l.type = mt; parts(); } catch {} }
+  };
+  form.addEventListener('click', e => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.f) { d.freq = b.dataset.f; sched(); }
+    else if (b.dataset.dm) { d.dailyMode = b.dataset.dm; sched(); }
+    else if (b.dataset.wd) { const v = Number(b.dataset.wd); d.weekdays = d.weekdays.includes(v) ? d.weekdays.filter(x => x !== v) : [...d.weekdays, v]; sched(); }
+    else if (b.dataset.day) { const v = b.dataset.day === 'L' ? 'L' : Number(b.dataset.day); d.days = d.days.includes(v) ? d.days.filter(x => x !== v) : [...d.days, v]; sched(); }
+    else if (b.dataset.rs) { d.subtasks = d.subtasks.filter(x => x.id !== b.dataset.rs); parts(); }
+    else if (b.dataset.rl) { d.links = d.links.filter(x => x.id !== b.dataset.rl); parts(); }
+    else if (b.dataset.rf) { d.files = d.files.filter(x => x.id !== b.dataset.rf); parts(); }
+    else if (b.id === 'recSubAdd') addSub();
+    else if (b.id === 'recLinkAdd') addLink();
+    else if (b.id === 'recFileBtn') $f('#recFileIn').click();
+  });
+  form.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    if (e.target.id === 'recSubIn') { e.preventDefault(); addSub(); }
+    if (e.target.id === 'recLinkIn') { e.preventDefault(); addLink(); }
+  });
+  form.querySelectorAll('[name=start],[name=end]').forEach(i => i.addEventListener('change', preview));
+  $f('#recFileIn').addEventListener('change', async e => {
+    const files = [...e.target.files]; e.target.value = '';
+    if (!files.length) return;
+    if (!auth.linked) { snack('Conecta tu cuenta de Google para subir archivos'); return; }
+    if (!auth.valid) { try { await signIn(true); } catch { snack('Reconecta tu cuenta para subir archivos'); return; } }
+    const cn = S.clientName($f('[name=clientId]').value || null);
+    for (const file of files) {
+      snack(`Subiendo ${file.name}…`);
+      try { const r2 = await uploadFile(file, cn); d.files.push({ id: uid(), driveId: r2.id, name: r2.name, url: r2.webViewLink, type: mimeToType(r2.mimeType), size: Number(r2.size || file.size), addedAt: new Date().toISOString() }); parts(); }
+      catch (err) { snack(`No se pudo subir ${file.name}: ${err.message}`); }
+    }
+    snack('Archivo listo en la plantilla');
+  });
+  sched(); parts();
+}
+
+function repeatFromTask(id) {
+  const t = S.getTask(id); if (!t) return;
+  let start = ymd(addDays(t.dueDate ? parseYmd(t.dueDate) : new Date(), 1));
+  if (start < todayStr()) start = todayStr();
+  recurringDialog(null, {
+    title: t.title, clientId: t.clientId || '', categoryId: t.categoryId || '', priority: t.priority, time: t.dueTime || '', notes: t.notes || '',
+    freq: 'daily', dailyMode: 'weekdays', start, end: '',
+    links: structuredClone(t.links || []), files: structuredClone(t.files || []), subtasks: (t.subtasks || []).map(s => ({ id: uid(), title: s.title }))
+  });
+}
+
+Object.assign(ACTIONS, {
+  repeat: el => repeatFromTask(el.dataset.id),
+  'rec-toggle': el => {
+    const r = store.state.recurring.find(x => x.id === el.dataset.id);
+    const next = { ...r, active: !r.active }; S.upsert('recurring', next);
+    const n = next.active ? S.activateTemplate(next) : 0;
+    commit(); if (n) snack(`${n} tarea${n === 1 ? '' : 's'} creada${n === 1 ? '' : 's'}`);
+  },
+  'rec-more': el => {
+    const r = store.state.recurring.find(x => x.id === el.dataset.id);
+    const monthly = S.recFreq(r) === 'monthly';
+    const m = $('#genMonth')?.value || monthAdd(ym(new Date()), 1);
+    menu(el, [
+      { label: 'Editar', icon: 'edit', run: () => recurringDialog(r) },
+      monthly
+        ? { label: `Generar en ${S.monthLabel(m)}`, icon: 'play', run: () => { const n = S.generateRecurring(m, { onlyTemplate: r.id }); commit(); snack(n ? `${n} tareas creadas en ${S.monthLabel(m)}` : 'Ya existían esas tareas'); } }
+        : { label: 'Generar próximos 7 días', icon: 'play', run: () => { const n = S.activateTemplate(r); commit(); snack(n ? `${n} tareas creadas` : 'Ya existían esas tareas'); } },
+      { label: 'Duplicar', icon: 'copy', run: () => { S.upsert('recurring', { ...structuredClone(r), id: uid(), title: r.title + ' (copia)', active: false }); commit(); snack('Copia creada (desactivada)'); } },
+      '-',
+      { label: 'Eliminar', icon: 'trash', run: () => {
+        if (!confirm(`¿Eliminar la recurrente “${r.title}”?`)) return;
+        const open = S.recOpenTasks(r.id);
+        if (open.length && confirm(`¿Eliminar también las ${open.length} tareas pendientes que ya generó? Las terminadas se conservan.`)) open.forEach(t => S.deleteTask(t.id));
+        S.remove('recurring', r.id); commit();
+      } }
+    ]);
+  }
+});
+
+
 // Logo con texto blanco para modo oscuro (se genera a partir del logo original)
 function makeDarkLogo() {
   const img = new Image();
