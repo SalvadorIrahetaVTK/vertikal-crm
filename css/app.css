@@ -417,7 +417,7 @@ a { color: var(--primary); text-decoration: none; }
   #syncChip { padding: 0 8px; }
   .topbar { padding: 0 12px; gap: 8px; }
   .main { padding: 12px 12px calc(120px + env(safe-area-inset-bottom)); }
-  .bottom-nav { display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 7; background: var(--surface); border-top: 1px solid var(--outline-var); height: calc(54px + env(safe-area-inset-bottom)); padding: 0 4px env(safe-area-inset-bottom); box-sizing: border-box; justify-content: space-around; align-items: center; }
+  .bottom-nav { display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 7; background: var(--surface); border: 0; box-shadow: none; height: calc(54px + env(safe-area-inset-bottom)); padding: 0 4px env(safe-area-inset-bottom); box-sizing: border-box; justify-content: space-around; align-items: center; }
   .bn-item { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 54px; gap: 1px; font-size: 10px; font-weight: 600; color: var(--on-surface-var); flex: 1; position: relative; }
   .bn-item .pill { width: 48px; height: 26px; border-radius: 13px; display: grid; place-items: center; transition: background .2s, width .35s var(--spring); position: relative; }
   .bn-item.active { color: var(--on-surface); }
