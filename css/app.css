@@ -547,6 +547,22 @@ body { overflow-x: hidden; }
   .arow .a-hide { display: none; }
   .rail-items { gap: 0; }
 }
+/* v2.1: menú inferior azul Vertikal, logo en modo oscuro, isotipo circular */
+.rail-brand, .rail-brand:hover { border-radius: 50%; }
+.rail-brand img { width: 26px; height: 26px; }
+.brand-logo.logo-dark { display: none !important; }
+@media (max-width: 840px) {
+  .bottom-nav { background: var(--brand-navy); }
+  .bn-item { color: rgba(255, 255, 255, .72); }
+  .bn-item.active { color: #fff; }
+  .bn-item.active .pill { background: var(--brand-blue); color: #fff; }
+  :root[data-theme="dark"] .brand-logo.logo-light { display: none; }
+  :root[data-theme="dark"] .brand-logo.logo-dark { display: block !important; }
+}
+@media (max-width: 840px) and (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .brand-logo.logo-light { display: none; }
+  :root:not([data-theme="light"]) .brand-logo.logo-dark { display: block !important; }
+}
 @media (max-height: 760px) and (min-width: 841px) {
   .rail-item { font-size: 10px; padding: 0 0 2px; }
   .rail-item .pill { height: 26px; }
