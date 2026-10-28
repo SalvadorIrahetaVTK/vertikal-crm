@@ -1521,8 +1521,24 @@ document.addEventListener('input', debounce(e => {
 
 
 // ---------------------------------------------------------------- arranque
+// Logo con texto blanco para modo oscuro (se genera a partir del logo original)
+function makeDarkLogo() {
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const x = c.getContext('2d'); x.drawImage(img, 0, 0);
+    const d = x.getImageData(0, 0, c.width, c.height);
+    const cut = Math.round(c.width * 46 / 214);
+    for (let y = 0; y < c.height; y++) for (let i = cut; i < c.width; i++) { const p = (y * c.width + i) * 4; d.data[p] = d.data[p + 1] = d.data[p + 2] = 255; }
+    x.putImageData(d, 0, 0);
+    document.querySelectorAll('.logo-dark').forEach(el => { el.src = c.toDataURL('image/png'); });
+  };
+  img.src = 'icons/logo.png';
+}
+
 function boot() {
   applyTheme();
+  makeDarkLogo();
   store.load();
   const mig = S.migrateCodes();
   const rec = S.autoRecurring();
