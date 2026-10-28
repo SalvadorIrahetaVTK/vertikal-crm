@@ -1,5 +1,5 @@
 /* Vertikal CRM · Service Worker */
-const VERSION = 'vkcrm-v2.0.3';
+const VERSION = 'vkcrm-v2.1.0';
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/config.js', './js/app.js', './js/store.js', './js/google.js', './js/sync.js', './js/util.js',
