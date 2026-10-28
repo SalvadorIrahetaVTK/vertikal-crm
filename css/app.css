@@ -547,6 +547,11 @@ body { overflow-x: hidden; }
   .arow .a-hide { display: none; }
   .rail-items { gap: 0; }
 }
+/* v3: recurrentes */
+.daypick.wk { grid-template-columns: repeat(7, 1fr); }
+.dialog { overflow-y: auto; }
+.dialog .section-title { margin: 6px 0 0; }
+
 /* v2.1: menú inferior azul Vertikal, logo en modo oscuro, isotipo circular */
 .rail-brand, .rail-brand:hover { border-radius: 50%; }
 .rail-brand img { width: 26px; height: 26px; }
