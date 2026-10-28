@@ -472,7 +472,7 @@ body { overflow-x: hidden; }
 @media (hover: none) { .grip { opacity: .55; } }
 .trow.sorting { background: var(--primary-container); border-radius: var(--r-md); box-shadow: var(--shadow-2); z-index: 3; }
 .trow.sorting .grip { cursor: grabbing; opacity: 1; }
-.ghost { position: fixed; z-index: 100; pointer-events: none; box-shadow: var(--shadow-3); transform: rotate(2deg) scale(1.02); opacity: .96; margin: 0; }
+.drag-ghost { position: fixed; z-index: 100; pointer-events: none; box-shadow: var(--shadow-3); transform: rotate(2deg) scale(1.02); opacity: .96; margin: 0; }
 .dragging { opacity: .35; }
 .kt .grip { display: inline-grid; vertical-align: middle; margin-left: -4px; }
 .carry { display: inline-flex; align-items: center; height: 16px; padding: 0 5px; border-radius: 5px; background: var(--warning-container); color: var(--warning); font-size: 10px; font-weight: 700; }
