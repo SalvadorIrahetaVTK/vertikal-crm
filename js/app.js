@@ -2,7 +2,7 @@
 import { $, $$, esc, icon, uid, todayStr, ymd, ym, parseYmd, addDays, monthAdd, monthName, fmtDate, fmtLongDate, fmtDateTime, fmtTime, fmtHM, relTime, debounce, linkInfo, typeIcon, mimeToType, fmtSize } from './util.js';
 import * as S from './store.js';
 import { store, STATUS, BOARD_STATUSES, PRIORITY, CLIENT_COLORS } from './store.js';
-import { auth, signIn, signOut, uploadFile, driveMeta, listEvents, createEvent } from './google.js';
+import { auth, signIn, signOut, uploadFile, driveMeta, listEvents, createEvent, listEventsRange, exportToSheet, archiveLoad } from './google.js';
 import { syncAll, scheduleSync, syncState, onSync } from './sync.js';
 
 const CFG = window.VK_CONFIG || {};
@@ -10,20 +10,24 @@ const TZ = CFG.TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
 const NAV = [
   { id: 'dashboard', label: 'Inicio', icon: 'dashboard' },
+  { id: 'week', label: 'Semana', icon: 'week' },
   { id: 'tasks', label: 'Tareas', icon: 'tasks' },
   { id: 'inbox', label: 'Inbox', icon: 'inbox' },
   { id: 'recurring', label: 'Recurrentes', icon: 'repeat' },
   { id: 'clients', label: 'Clientes', icon: 'clients' },
   { id: 'agenda', label: 'Agenda', icon: 'calendar' },
+  { id: 'stats', label: 'Estadísticas', icon: 'chart' },
+  { id: 'archive', label: 'Archivo', icon: 'archive' },
   { id: 'settings', label: 'Ajustes', icon: 'settings' }
 ];
-const MOBILE_NAV = ['dashboard', 'tasks', 'inbox', 'agenda'];
-const TITLES = { dashboard: 'Dashboard', tasks: 'Tareas', inbox: 'Inbox', recurring: 'Tareas recurrentes', clients: 'Clientes', agenda: 'Agenda', settings: 'Ajustes' };
+const MOBILE_NAV = ['dashboard', 'week', 'tasks', 'inbox'];
+const TITLES = { dashboard: 'Dashboard', week: 'Mi semana', tasks: 'Tareas', inbox: 'Inbox', recurring: 'Tareas recurrentes', clients: 'Clientes', agenda: 'Agenda', stats: 'Estadísticas', archive: 'Archivo', settings: 'Ajustes' };
 
 const ui = {
   route: 'dashboard', params: {}, openId: null,
   f: { st: 'active', client: '', cat: '', period: 'all', q: '', view: localStorage.getItem('vkcrm.view') || 'list' },
-  events: [], eventsAt: 0, eventsErr: null, uploads: {}
+  events: [], eventsAt: 0, eventsErr: null, uploads: {},
+  weekStart: null, weekEvents: {}, statsPeriod: 'month', archF: { client: '', cat: '', q: '' }, archOpen: null
 };
 
 // ---------------------------------------------------------------- helpers de UI
@@ -43,12 +47,15 @@ const metaIcons = t => {
   if (t.source === 'recurring') out.push(`<span title="Recurrente">${icon('repeat', 'xs')}</span>`);
   if (t.source === 'gmail') out.push(`<span title="Desde Gmail">${icon('mail', 'xs')}</span>`);
   if (t.gtaskId) out.push(`<span title="En Google Tasks (widget)">${icon('gtasks', 'xs')}</span>`);
+  if (t.carriedFrom && t.status !== 'done') out.push(`<span class="carry" title="Pendiente desde ${S.monthLabel(t.carriedFrom)}">De ${S.monthLabel(t.carriedFrom).slice(0, 3)}</span>`);
   return out.length ? `<span class="meta-icons">${out.join('')}</span>` : '';
 };
 
-function taskRow(t) {
+const grip = on => on ? `<span class="grip" data-grip title="Arrastra para ordenar">${icon('grip', 'sm')}</span>` : '<span class="grip off"></span>';
+function taskRow(t, sortable = false) {
   const done = t.status === 'done', over = S.isOverdue(t);
   return `<div class="trow ${done ? 'is-done' : ''} ${over ? 'is-over' : ''}" data-act="open" data-id="${t.id}" draggable="false">
+    ${grip(sortable && !done)}
     <button class="check ${done ? 'on' : ''}" data-act="toggle" data-id="${t.id}" aria-label="Completar">${icon('check')}</button>
     <span class="code col-code">${esc(t.code)}</span>
     <div class="tcell"><div class="ttitle"><span class="t">${esc(t.title)}</span>${metaIcons(t)}</div>
@@ -61,9 +68,10 @@ function taskRow(t) {
     <button class="icon-btn sm col-more" data-act="row-menu" data-id="${t.id}" aria-label="Más">${icon('more')}</button>
   </div>`;
 }
-function compactRow(t) {
+function compactRow(t, sortable = false) {
   const done = t.status === 'done', over = S.isOverdue(t);
   return `<div class="trow ${done ? 'is-done' : ''} ${over ? 'is-over' : ''}" data-act="open" data-id="${t.id}">
+    ${grip(sortable && !done)}
     <button class="check ${done ? 'on' : ''}" data-act="toggle" data-id="${t.id}" aria-label="Completar">${icon('check')}</button>
     <div class="tcell"><div class="ttitle"><span class="t">${esc(t.title)}</span>${metaIcons(t)}</div>
       <div class="cmeta"><i class="cdot" style="background:${esc(cColor(t.clientId))}"></i>${esc(S.clientName(t.clientId))}${t.categoryId ? ' · ' + esc(S.categoryName(t.categoryId)) : ''}${t.priority === 'high' ? ' · <b class="prio-high">Alta</b>' : ''}</div></div>
@@ -71,7 +79,7 @@ function compactRow(t) {
     <span class="tdue">${dueLabel(t)}</span>
   </div>`;
 }
-const listHead = () => `<div class="trow thead"><span></span><span class="col-code">Cód.</span><span>Tarea</span><span class="col-client">Cliente</span><span class="col-cat">Categoría</span><span class="col-prio"></span><span class="col-status">Estado</span><span>Fecha</span><span class="col-more"></span></div>`;
+const listHead = () => `<div class="trow thead"><span class="grip off"></span><span></span><span class="col-code">Cód.</span><span>Tarea</span><span class="col-client">Cliente</span><span class="col-cat">Categoría</span><span class="col-prio"></span><span class="col-status">Estado</span><span>Fecha</span><span class="col-more"></span></div>`;
 const emptyBox = (txt, ic = 'check', big = false) => `<div class="empty ${big ? 'big' : ''}">${icon(ic)}${txt}</div>`;
 const opt = (v, label, sel) => `<option value="${esc(v)}" ${String(v) === String(sel ?? '') ? 'selected' : ''}>${esc(label)}</option>`;
 const clientOptions = (sel, none = 'Sin cliente') => opt('', none, sel) + S.clients().map(c => opt(c.id, c.name, sel)).join('') + (sel && S.getClient(sel)?.archived ? opt(sel, S.clientName(sel) + ' (archivado)', sel) : '');
@@ -88,6 +96,7 @@ function parseHash() {
   if (parts[0] === 'task' && parts[1]) { ui.openId = parts[1]; ui.route = ui.route && ui.route !== 'task' ? ui.route : 'tasks'; history.replaceState(null, '', '#/' + ui.route); }
   else ui.route = NAV.some(n => n.id === parts[0]) ? parts[0] : 'dashboard';
   ui.params = params;
+  ui.archOpen = ui.route === 'archive' && parts[1] ? parts[1] : null;
   if (ui.route === 'tasks' && params.f) { ui.f.st = params.f; }
   if (ui.route === 'tasks' && params.client) { ui.f.client = params.client; }
   if (params.new) setTimeout(() => taskDialog(), 50);
@@ -110,7 +119,7 @@ function render() {
   const view = VIEWS[ui.route] || VIEWS.dashboard;
   $('#view').innerHTML = view();
   afterRender();
-  if (ui.openId) renderSheet(); else closeSheet(false);
+  if (ui.openId) renderSheet(); else if (ui.archTask) renderArchSheet(); else closeSheet(false);
   renderAccount();
 }
 
@@ -118,17 +127,17 @@ function render() {
 function viewDashboard() {
   const all = S.tasks();
   const today = todayStr();
-  const todayOpen = all.filter(t => S.isOpen(t) && t.dueDate === today && !S.isOverdue(t)).sort(byDue);
+  const todayOpen = all.filter(t => S.isOpen(t) && t.dueDate === today && !S.isOverdue(t)).sort(S.orderCmp);
   const doneToday = all.filter(t => S.doneOn(t, today)).sort((a, b) => b.completedAt.localeCompare(a.completedAt));
-  const over = all.filter(t => S.isOverdue(t)).sort(byDue);
-  const prog = all.filter(t => t.status === 'progress' || t.status === 'following').sort(byDue);
+  const over = all.filter(t => S.isOverdue(t)).sort(S.orderCmp);
+  const prog = all.filter(t => t.status === 'progress' || t.status === 'following').sort(S.orderCmp);
   const inbox = all.filter(t => t.status === 'inbox');
   const monthDone = all.filter(t => t.status === 'done' && t.completedAt && ym(new Date(t.completedAt)) === ym(new Date())).length;
   const h = new Date().getHours();
   const greet = h < 12 ? 'Buenos días' : h < 18 ? 'Buenas tardes' : 'Buenas noches';
   if (auth.valid && Date.now() - ui.eventsAt > 5 * 60e3) loadEvents();
 
-  return `
+  return `${archiveBanner()}
   <div class="hero">
     <div><h2>${greet}, ${esc(CFG.USER_NAME || '')}</h2><p>${fmtLongDate(new Date())} · ${todayOpen.length + over.length} pendientes para hoy</p></div>
     <div class="toolbar" style="margin:0">
@@ -146,12 +155,12 @@ function viewDashboard() {
   <div class="grid dash">
     <section class="card span-7">
       <div class="card-h"><h3>${icon('clock', 'sm')}Hoy</h3><span class="count">${todayOpen.length}</span><span class="sp"></span><a class="btn text sm" href="#/tasks?f=today">Ver todo</a></div>
-      <div class="tlist compact">${todayOpen.map(compactRow).join('') || emptyBox('Nada pendiente para hoy')}
-      ${doneToday.length ? `<div class="section-title">Terminadas hoy<span class="sp"></span></div>${doneToday.map(compactRow).join('')}` : ''}</div>
+      <div class="tlist compact"><div data-sort>${todayOpen.map(t => compactRow(t, true)).join('')}</div>${todayOpen.length ? '' : emptyBox('Nada pendiente para hoy')}
+      ${doneToday.length ? `<div class="section-title">Terminadas hoy<span class="sp"></span></div>${doneToday.map(t => compactRow(t)).join('')}` : ''}</div>
     </section>
     <section class="card span-5">
       <div class="card-h"><h3 style="color:var(--error)">${icon('alert', 'sm')}Atrasadas</h3><span class="count">${over.length}</span></div>
-      <div class="tlist compact">${over.map(compactRow).join('') || emptyBox('¡Excelente! No hay tareas atrasadas')}</div>
+      <div class="tlist compact" data-sort>${over.map(t => compactRow(t, true)).join('') || emptyBox('¡Excelente! No hay tareas atrasadas')}</div>
     </section>
     <section class="card span-4">
       <div class="card-h"><h3>${icon('calendar', 'sm')}Próximas reuniones</h3><span class="sp"></span><button class="icon-btn sm" data-act="meet-new" title="Nueva reunión">${icon('plus')}</button></div>
@@ -167,7 +176,7 @@ function viewDashboard() {
     </section>
     <section class="card span-7">
       <div class="card-h"><h3>${icon('progress', 'sm')}En desarrollo y seguimiento</h3><span class="count">${prog.length}</span></div>
-      <div class="tlist compact">${prog.map(compactRow).join('') || emptyBox('Sin tareas en desarrollo', 'progress')}</div>
+      <div class="tlist compact" data-sort>${prog.map(t => compactRow(t, true)).join('') || emptyBox('Sin tareas en desarrollo', 'progress')}</div>
     </section>
     <section class="card span-5">
       <div class="card-h"><h3>${icon('link', 'sm')}Accesos rápidos</h3><span class="sp"></span><button class="icon-btn sm" data-act="quick-add" title="Agregar acceso">${icon('plus')}</button></div>
@@ -262,7 +271,7 @@ function filterTasks(st = ui.f.st) {
 }
 function groupTasks(arr) {
   const today = todayStr(), tom = ymd(addDays(new Date(), 1)), wk = ymd(addDays(new Date(), 7));
-  const open = arr.filter(t => t.status !== 'done').sort(byDue);
+  const open = arr.filter(t => t.status !== 'done').sort(S.orderCmp);
   const done = arr.filter(t => t.status === 'done').sort((a, b) => (b.completedAt || '').localeCompare(a.completedAt || ''));
   const G = [['Atrasadas', t => S.isOverdue(t)], ['Hoy', t => t.dueDate === today], ['Mañana', t => t.dueDate === tom], ['Próximos 7 días', t => t.dueDate && t.dueDate <= wk], ['Más adelante', t => !!t.dueDate], ['Sin fecha', () => true]];
   const used = new Set(), groups = [];
@@ -277,11 +286,11 @@ function viewTasks() {
   const body = ui.f.view === 'board' ? boardHtml(arr) : (() => {
     const groups = groupTasks(arr);
     if (!groups.length) return `<div class="card">${emptyBox('No hay tareas con estos filtros', 'tasks', true)}</div>`;
-    return `<div class="card" style="padding:8px 10px">${listHead()}${groups.map(([g, list]) => `<div class="section-title" ${g === 'Atrasadas' ? 'style="color:var(--error)"' : ''}>${g} · ${list.length}<span class="sp"></span></div><div class="tlist">${list.map(taskRow).join('')}</div>`).join('')}</div>`;
+    return `<div class="card" style="padding:8px 10px">${listHead()}${groups.map(([g, list]) => `<div class="section-title" ${g === 'Atrasadas' ? 'style="color:var(--error)"' : ''}>${g} · ${list.length}<span class="sp"></span></div><div class="tlist" ${g === 'Terminadas' ? '' : 'data-sort'}>${list.map(t => taskRow(t, g !== 'Terminadas')).join('')}</div>`).join('')}</div>`;
   })();
   return `
   <div class="toolbar">
-    <div class="seg" role="tablist">${FILTERS.map(([k, l]) => `<button class="${ui.f.st === k ? 'on' : ''}" data-act="filter-st" data-v="${k}">${l}<span class="n">${counts[k]}</span></button>`).join('')}</div>
+    <div class="seg-scroll"><div class="seg" role="tablist">${FILTERS.map(([k, l]) => `<button class="${ui.f.st === k ? 'on' : ''}" data-act="filter-st" data-v="${k}">${l}<span class="n">${counts[k]}</span></button>`).join('')}</div></div>
   </div>
   <div class="toolbar">
     <select class="select mini" data-ch="filter" data-k="client" style="width:auto">${clientOptions(ui.f.client, 'Todos los clientes')}</select>
@@ -297,10 +306,10 @@ function viewTasks() {
 function boardHtml(arr) {
   return `<div class="board">${BOARD_STATUSES.map(st => {
     let list = arr.filter(t => t.status === st);
-    list = st === 'done' ? list.sort((a, b) => (b.completedAt || '').localeCompare(a.completedAt || '')).slice(0, 40) : list.sort(byDue);
+    list = st === 'done' ? list.sort((a, b) => (b.completedAt || '').localeCompare(a.completedAt || '')).slice(0, 40) : list.sort(S.orderCmp);
     return `<div class="col" data-drop="${st}"><div class="col-h"><span class="status st-${st}" style="cursor:default">${icon(STATUS[st].icon)}${STATUS[st].label}</span><span class="count">${list.length}</span></div>
-      ${list.map(t => `<div class="kcard" draggable="true" data-drag="${t.id}" data-act="open" data-id="${t.id}" style="border-left-color:${esc(cColor(t.clientId))}">
-        <div class="kt">${t.priority === 'high' ? `<span class="prio-high">${icon('flag', 'xs')}</span> ` : ''}${esc(t.title)}</div>
+      ${list.map(t => `<div class="kcard" data-gdrag="${t.id}" data-act="open" data-id="${t.id}" style="border-left-color:${esc(cColor(t.clientId))}">
+        <div class="kt"><span class="grip" data-ghost title="Arrastra para mover">${icon('grip', 'sm')}</span>${t.priority === 'high' ? `<span class="prio-high">${icon('flag', 'xs')}</span> ` : ''}${esc(t.title)}</div>
         <div class="km">${clientChip(t.clientId)}<span class="tdue ${S.isOverdue(t) ? 'over-pill' : 'muted'}">${dueLabel(t)}</span></div>
         ${metaIcons(t) ? `<div class="km">${metaIcons(t)}<span class="code">${esc(t.code)}</span></div>` : ''}
       </div>`).join('') || `<div class="empty small">Arrastra tareas aquí</div>`}</div>`;
@@ -432,12 +441,12 @@ const syncText = () => {
   return s.lastSync ? 'Última sincronización ' + relTime(s.lastSync) : 'Pendiente';
 };
 
-const VIEWS = { dashboard: viewDashboard, tasks: viewTasks, inbox: viewInbox, recurring: viewRecurring, clients: viewClients, agenda: viewAgenda, settings: viewSettings };
+const VIEWS = { dashboard: viewDashboard, week: viewWeek, tasks: viewTasks, inbox: viewInbox, recurring: viewRecurring, clients: viewClients, agenda: viewAgenda, stats: viewStats, archive: viewArchive, settings: viewSettings };
 
 // ---------------------------------------------------------------- HOJA DE DETALLE
 function openTask(id) { ui.openId = id; renderSheet(); }
 function closeSheet(update = true) {
-  ui.openId = null;
+  ui.openId = null; ui.archTask = null;
   $('#sheet').classList.remove('on'); $('#scrim').classList.remove('on'); $('#sheet').setAttribute('aria-hidden', 'true');
 }
 function renderSheet() {
@@ -543,7 +552,7 @@ function taskDialog(preset = {}) {
       <label class="field"><span>Categoría</span><select class="select" name="categoryId">${catOptions('')}</select></label>
     </div>
     <div class="row3">
-      <label class="field"><span>Fecha límite</span><input class="input" type="date" name="dueDate" value="${preset.status === 'inbox' ? '' : todayStr()}"></label>
+      <label class="field"><span>Fecha límite</span><input class="input" type="date" name="dueDate" value="${preset.dueDate || (preset.status === 'inbox' ? '' : todayStr())}"></label>
       <label class="field"><span>Hora</span><input class="input" type="time" name="dueTime"></label>
       <label class="field"><span>Prioridad</span><select class="select" name="priority">${prioOptions('normal')}</select></label>
     </div>
@@ -835,6 +844,7 @@ async function addLink(taskId, url) {
 
 // ---------------------------------------------------------------- EVENTOS GLOBALES
 document.addEventListener('click', e => {
+  if (Date.now() < (ui.suppressUntil || 0)) { e.preventDefault(); return; }
   const go = e.target.closest('[data-go]');
   if (go) { location.hash = go.dataset.go; return; }
   const el = e.target.closest('[data-act]');
@@ -960,7 +970,7 @@ function applyTheme() {
   const t = localStorage.getItem('vkcrm.theme') || 'auto';
   if (t === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
   const dark = t === 'dark' || (t === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
-  document.querySelector('meta[name=theme-color]').content = dark ? '#060B33' : '#000A4F';
+  document.querySelectorAll('meta[name=theme-color]').forEach(m => { m.content = dark ? '#0E1024' : '#F7F8FC'; m.removeAttribute('media'); });
 }
 
 // ---------------------------------------------------------------- commit + render
@@ -971,6 +981,7 @@ store.subscribe(meta => {
   const viewFocused = $('#view').contains(document.activeElement) && /INPUT|TEXTAREA/.test(document.activeElement.tagName);
   if (!viewFocused || meta.from === 'sheet') { $('#view').innerHTML = VIEWS[ui.route](); afterRender(); }
   if (ui.openId && meta.from !== 'sheet' && !(meta.remote && sheetFocused)) renderSheet();
+  else if (ui.archTask && !ui.openId) renderArchSheet();
   if (!meta.remote) scheduleSync();
   if (meta.recurring?.n) snack(`${meta.recurring.n} tareas recurrentes generadas para ${meta.recurring.months.map(m => monthName(m)).join(' y ')}`);
   checkOverdue();
@@ -1005,11 +1016,518 @@ async function registerPeriodic() {
   } catch {}
 }
 
+// ================================================================ v2: archivo, semana, estadísticas, exportaciones
+
+// ---------------------------------------------------------------- utilidades de mes
+const shortMonth = m => S.monthLabel(m).slice(0, 3);
+const fmtDur = ms => {
+  if (ms == null || isNaN(ms)) return '—';
+  const h = ms / 3600e3;
+  if (h < 1) return Math.max(1, Math.round(ms / 60e3)) + ' min';
+  if (h < 24) return h.toFixed(1).replace('.0', '') + ' h';
+  return (h / 24).toFixed(1).replace('.0', '') + ' días';
+};
+const pl = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const absDate = s => { if (!s) return ''; const d = parseYmd(s); return `${d.getDate()} ${shortMonth(ym(d))}`; };
+const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+const pct = (a, b) => b ? Math.round(a / b * 100) : 0;
+
+function monthData(m) {
+  const a = S.getArchive(m);
+  if (a) return { archived: true, archivedAt: a.archivedAt, done: a.tasks.map(t => ({ ...t, _refs: a })), pending: (a.pending || []).map(t => ({ ...t, _refs: a })) };
+  if (S.isArchived(m)) return { archived: true, missing: true, done: [], pending: [] };
+  const { done, pending } = S.archivePreview(m);
+  return { archived: false, done, pending };
+}
+
+function summarize(done) {
+  const byClient = new Map(), byCat = new Map();
+  for (const t of done) {
+    const c = S.refClientName(t), k = S.refCategoryName(t);
+    if (!byClient.has(c)) byClient.set(c, { name: c, color: S.refClientColor(t), list: [] });
+    byClient.get(c).list.push(t);
+    if (!byCat.has(k)) byCat.set(k, { name: k, list: [] });
+    byCat.get(k).list.push(t);
+  }
+  const rows = map => [...map.values()].map(r => ({
+    ...r, n: r.list.length, late: r.list.filter(S.wasLate).length,
+    avg: avg(r.list.map(S.deliveryMs).filter(x => x != null))
+  })).sort((a, b) => b.n - a.n);
+  return {
+    n: done.length, late: done.filter(S.wasLate).length,
+    avg: avg(done.map(S.deliveryMs).filter(x => x != null)),
+    clients: rows(byClient), cats: rows(byCat)
+  };
+}
+
+// ---------------------------------------------------------------- banner y diálogo de archivo
+function archiveBanner() {
+  const ms = S.archivableMonths(); if (!ms.length) return '';
+  const m = ms[0]; const { done, pending } = S.archivePreview(m);
+  return `<div class="banner arch">${icon('archive')}<div class="t"><b>Cierre de ${S.monthLabel(m)}</b><span>${done.length} tareas terminadas listas para archivar · ${pending.length} pendientes pasan a ${S.monthLabel(monthAdd(m, 1))}${ms.length > 1 ? ` · ${ms.length - 1} mes${ms.length > 2 ? 'es' : ''} más por archivar` : ''}</span></div>
+    <button class="btn filled sm" data-act="archive-month" data-m="${m}">${icon('archive', 'sm')}Archivar mes</button></div>`;
+}
+
+function archiveDialog(m) {
+  const { done, pending } = S.archivePreview(m);
+  dialog(`${dlgHead('Archivar ' + S.monthLabel(m), 'archive')}
+  <div class="dlg-b">
+    <p style="margin:0">Se guardarán <b>${done.length} tareas terminadas</b> en ${S.monthLabel(m)} con toda su información: notas, subtareas, enlaces, archivos, fechas e historial. Quedarán en <b>Archivo</b> como solo lectura.</p>
+    <p style="margin:0" class="muted">${pending.length ? `${pending.length} tareas sin terminar siguen activas y pasan a ${S.monthLabel(monthAdd(m, 1))} con la marca “De ${shortMonth(m)}”.` : 'No quedan tareas pendientes de este mes.'}</p>
+    <label class="small" style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="pdf" checked> Abrir el reporte PDF del mes al terminar</label>
+  </div>${dlgFoot('Archivar mes')}`, fd => {
+    const win = fd.pdf ? window.open('', '_blank') : null;
+    S.archiveMonth(m); commit();
+    snack(`${S.monthLabel(m)} archivado`, 'Ver', () => { location.hash = '#/archive/' + m; });
+    if (win) openReport(m, win);
+  });
+}
+
+// ---------------------------------------------------------------- vista Archivo
+function viewArchive() {
+  if (ui.archOpen) return viewArchiveMonth(ui.archOpen);
+  const cur = ym(new Date());
+  const pending = S.archivableMonths();
+  const months = S.archivedMonths();
+  const live = S.isArchived(cur) ? null : summarize(S.archivePreview(cur).done);
+  const card = (m, info, isLive) => `<div class="ccard amonth" style="--c:${isLive ? 'var(--brand-green)' : 'var(--navy)'}">
+    <h4>${S.monthLabel(m)}${isLive ? '<span class="tag">En curso</span>' : `<span class="lock-chip">${icon('lock')}Archivado</span>`}</h4>
+    <div class="stats"><div><b>${info.count}</b>terminadas</div><div><b>${info.pending ?? 0}</b>pasaron al siguiente</div><div><b>${S.monthCount(m)}</b>creadas</div></div>
+    <div class="small muted">${isLive ? 'Se puede archivar desde el último día del mes' : 'Archivado el ' + fmtDateTime(info.archivedAt)}${!isLive && !S.getArchive(m) ? ' · se descarga al sincronizar con Google' : ''}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${isLive ? `<a class="btn tonal sm" href="#/tasks?f=done">${icon('tasks', 'sm')}Ver terminadas</a>` : `<a class="btn tonal sm" href="#/archive/${m}">${icon('eye', 'sm')}Ver tareas</a>`}
+      <button class="btn outlined sm" data-act="report" data-m="${m}">${icon('pdf', 'sm')}PDF</button>
+      <button class="btn outlined sm" data-act="sheet-export" data-m="${m}">${icon('sheet', 'sm')}Sheets</button>
+    </div></div>`;
+  return `${pending.map(m => { const p = S.archivePreview(m); return `<div class="banner arch">${icon('archive')}<div class="t"><b>${S.monthLabel(m)} está listo para archivar</b><span>${p.done.length} terminadas · ${p.pending.length} pasan a ${S.monthLabel(monthAdd(m, 1))}</span></div><button class="btn filled sm" data-act="archive-month" data-m="${m}">Archivar mes</button></div>`; }).join('')}
+  <div class="toolbar"><span class="muted">Cada mes archivado guarda las tareas terminadas tal como estaban, en solo lectura.</span></div>
+  <div class="cgrid">
+    ${live ? card(cur, { count: live.n, pending: S.archivePreview(cur).pending.length }, true) : ''}
+    ${months.map(m => card(m, store.state.settings.archives[m], false)).join('')}
+  </div>
+  ${!months.length ? `<div class="card" style="margin-top:12px">${emptyBox('Todavía no hay meses archivados. El último día de cada mes aparecerá la opción “Archivar mes”.', 'archive', true)}</div>` : ''}`;
+}
+
+function viewArchiveMonth(m) {
+  const d = monthData(m);
+  if (d.missing) {
+    if (auth.valid && !ui.archLoading) {
+      ui.archLoading = true;
+      archiveLoad(m).then(r => { if (r) S.saveArchive({ ...r, uploaded: true }); }).catch(e => snack(e.message)).finally(() => { ui.archLoading = false; if (ui.route === 'archive') render(); });
+    }
+    return `<a class="btn text sm" href="#/archive">${icon('left', 'sm')}Archivo</a><div class="card">${emptyBox(auth.valid ? 'Descargando el archivo de ' + S.monthLabel(m) + '…' : 'Conecta tu cuenta de Google para ver este mes archivado.', 'archive', true)}</div>`;
+  }
+  const f = ui.archF, q = f.q.trim().toLowerCase();
+  const sum = summarize(d.done);
+  const clientsOpt = [...new Map(d.done.map(t => [t.clientId || '', S.refClientName(t)])).entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  const catsOpt = [...new Map(d.done.map(t => [t.categoryId || '', S.refCategoryName(t)])).entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  let list = d.done.filter(t => (!f.client || (t.clientId || '') === f.client) && (!f.cat || (t.categoryId || '') === f.cat)
+    && (!q || [t.title, t.code, t.notes, S.refClientName(t), S.refCategoryName(t), ...(t.subtasks || []).map(s => s.title)].join(' ').toLowerCase().includes(q)));
+  list.sort((a, b) => (b.completedAt || '').localeCompare(a.completedAt || ''));
+  let last = '', rows = '';
+  for (const t of list) {
+    const day = ymd(new Date(t.completedAt));
+    if (day !== last) { rows += `<div class="section-title">${fmtLongDate(parseYmd(day))}<span class="sp"></span></div>`; last = day; }
+    rows += `<div class="arow" data-act="arch-open" data-m="${m}" data-id="${t.id}">
+      <span class="code">${esc(t.code)}</span><span class="t">${esc(t.title)}</span>
+      <span class="cchip a-hide"><i class="cdot" style="background:${esc(S.refClientColor(t))}"></i><span class="n">${esc(S.refClientName(t))}</span></span>
+      <span class="a-hide"><span class="tag">${esc(S.refCategoryName(t))}</span></span>
+      <span class="small a-hide">${fmtTime(new Date(t.completedAt))}${t.dueDate ? ' · vencía ' + absDate(t.dueDate) : ''}</span>
+      <span class="small ${S.wasLate(t) ? 'late' : 'ontime'}">${S.wasLate(t) ? 'Tarde' : 'A tiempo'}</span></div>`;
+  }
+  return `<div class="toolbar"><a class="btn text sm" href="#/archive">${icon('left', 'sm')}Archivo</a>
+    <h2 style="margin:0;font-size:18px;text-transform:capitalize">${S.monthLabel(m)}</h2>
+    ${d.archived ? `<span class="lock-chip">${icon('lock')}Archivado ${fmtDateTime(d.archivedAt)}</span>` : ''}
+    <span class="sp"></span>
+    <button class="btn outlined sm" data-act="report" data-m="${m}">${icon('pdf', 'sm')}Exportar PDF</button>
+    <button class="btn outlined sm" data-act="sheet-export" data-m="${m}">${icon('sheet', 'sm')}Exportar a Sheets</button></div>
+  <div class="stiles">
+    <div class="stile"><div class="lbl">Terminadas</div><div class="val">${sum.n}</div><div class="sub">${sum.clients.length} clientes</div></div>
+    <div class="stile"><div class="lbl">A tiempo</div><div class="val">${pct(sum.n - sum.late, sum.n)}%</div><div class="sub">${sum.late} tarde</div></div>
+    <div class="stile"><div class="lbl">Entrega promedio</div><div class="val">${fmtDur(sum.avg)}</div><div class="sub">de ingreso a finalización</div></div>
+    <div class="stile"><div class="lbl">Cliente principal</div><div class="val" style="font-size:16px;padding-top:6px">${esc(sum.clients[0]?.name || '—')}</div><div class="sub">${sum.clients[0] ? pl(sum.clients[0].n, 'tarea') : ''}</div></div>
+    <div class="stile"><div class="lbl">Pasaron al siguiente mes</div><div class="val">${d.pending.length}</div><div class="sub">pendientes al cierre</div></div>
+  </div>
+  <div class="toolbar">
+    <select class="select mini" style="width:auto" data-ch2="archf" data-k="client">${opt('', 'Todos los clientes', f.client)}${clientsOpt.map(([id, n]) => opt(id, n, f.client)).join('')}</select>
+    <select class="select mini" style="width:auto" data-ch2="archf" data-k="cat">${opt('', 'Todas las categorías', f.cat)}${catsOpt.map(([id, n]) => opt(id, n, f.cat)).join('')}</select>
+    <input class="input mini" style="max-width:240px" data-ch2="archf" data-k="q" value="${esc(f.q)}" placeholder="Buscar en ${shortMonth(m)}…">
+    <span class="muted small">${list.length} de ${d.done.length}</span>
+  </div>
+  <div class="card" style="padding:6px 10px">${rows || emptyBox('Sin tareas con estos filtros', 'archive')}</div>
+  ${d.pending.length ? `<div class="section-title">Pendientes que pasaron a ${S.monthLabel(monthAdd(m, 1))} · ${d.pending.length}<span class="sp"></span></div>
+    <div class="card" style="padding:6px 10px">${d.pending.map(p => `<div class="arow" ${S.getTask(p.id) ? `data-act="open" data-id="${p.id}"` : ''}><span class="code">${esc(p.code)}</span><span class="t">${esc(p.title)}</span><span class="cchip a-hide"><i class="cdot" style="background:${esc(S.refClientColor(p))}"></i><span class="n">${esc(S.refClientName(p))}</span></span><span class="a-hide small">${p.dueDate ? 'Vence ' + fmtDate(p.dueDate) : 'Sin fecha'}</span><span class="a-hide"></span><span class="small muted">${STATUS[p.status]?.label || ''}</span></div>`).join('')}</div>` : ''}`;
+}
+
+// Hoja de detalle en solo lectura (tarea archivada)
+function renderArchSheet() {
+  const { m, id } = ui.archTask || {};
+  const a = S.getArchive(m); const t0 = a?.tasks.find(x => x.id === id);
+  if (!t0) { closeSheet(); return; }
+  const t = { ...t0, _refs: a };
+  const ro = (label, val) => `<div class="field"><span>${label}</span><div class="ro">${val || '—'}</div></div>`;
+  const sh = $('#sheet');
+  sh.innerHTML = `<div class="sheet-h"><span class="code">${esc(t.code)}</span><span class="status st-done" style="cursor:default">${icon('done')}Terminada</span><span class="lock-chip">${icon('lock')}Archivada · ${S.monthLabel(m)}</span>
+    <span style="flex:1"></span><button class="icon-btn" data-act="close-sheet" title="Cerrar">${icon('close')}</button></div>
+  <div class="sheet-b">
+    <div class="sheet-title" style="padding:6px 0">${esc(t.title)}</div>
+    <div class="props">
+      ${ro('Cliente', `<span class="cchip"><i class="cdot" style="background:${esc(S.refClientColor(t))}"></i>${esc(S.refClientName(t))}</span>`)}
+      ${ro('Categoría', esc(S.refCategoryName(t)))}
+      ${ro('Prioridad', PRIORITY[t.priority] || '')}
+      ${ro('Origen', { manual: 'Manual', recurring: 'Recurrente', gmail: 'Gmail', gtasks: 'Google Tasks' }[t.source] || t.source)}
+      ${ro('Fecha límite', t.dueDate ? fmtDate(t.dueDate) + (t.dueTime ? ' · ' + fmtHM(t.dueTime) : '') : '')}
+      ${ro('Resultado', S.wasLate(t) ? '<span class="late">Terminada tarde</span>' : '<span class="ontime">A tiempo</span>')}
+    </div>
+    <div class="stamps">
+      <div class="stamp"><b>Ingresada</b><span>${fmtDateTime(t.createdAt)}</span></div>
+      <div class="stamp"><b>Iniciada</b><span>${t.startedAt ? fmtDateTime(t.startedAt) : '—'}</span></div>
+      <div class="stamp done-st"><b>Finalizada</b><span>${fmtDateTime(t.completedAt)}</span></div>
+    </div>
+    <div class="section-title">Notas<span class="sp"></span></div>
+    <div class="ro-notes">${esc(t.notes) || '<span class="muted">Sin notas</span>'}</div>
+    ${(t.subtasks || []).length ? `<div class="section-title">Subtareas · ${t.subtasks.filter(s => s.done).length}/${t.subtasks.length}<span class="sp"></span></div>
+      ${t.subtasks.map(s => `<div class="sub-row ${s.done ? 'done' : ''}"><span class="check ${s.done ? 'on' : ''}" style="cursor:default">${icon('check')}</span><span style="flex:1;${s.done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${esc(s.title)}</span>${s.doneAt ? `<span class="small muted">${fmtDate(ymd(new Date(s.doneAt)), false)}</span>` : ''}</div>`).join('')}` : ''}
+    ${(t.links || []).length ? `<div class="section-title">Enlaces<span class="sp"></span></div>${t.links.map(l => `<div class="link-row"><span class="ficon f-${l.type}">${icon(typeIcon(l.type))}</span><div class="lt"><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a><small>${esc(linkInfo(l.url).label)}</small></div></div>`).join('')}` : ''}
+    ${(t.files || []).length ? `<div class="section-title">Archivos<span class="sp"></span></div>${t.files.map(f => `<div class="link-row"><span class="ficon f-${f.type}">${icon(typeIcon(f.type))}</span><div class="lt"><a href="${esc(f.url)}" target="_blank" rel="noopener">${esc(f.name)}</a><small>${f.size ? fmtSize(f.size) : ''}</small></div></div>`).join('')}` : ''}
+    <div class="section-title">Actividad<span class="sp"></span></div>
+    ${(t.log || []).map(l => `<div class="logline"><time>${fmtDateTime(l.at)}</time><span>${esc(l.text)}</span></div>`).join('')}
+    <div class="sheet-actions"><button class="btn tonal sm" data-act="arch-copy" data-m="${m}" data-id="${t.id}">${icon('copy', 'sm')}Usar como base para una tarea nueva</button></div>
+  </div>`;
+  sh.classList.add('on'); sh.setAttribute('aria-hidden', 'false'); $('#scrim').classList.add('on');
+}
+
+// ---------------------------------------------------------------- reporte PDF (vista de impresión con marca Vertikal)
+function reportHtml(m, d) {
+  const sum = summarize(d.done);
+  const next = S.monthLabel(monthAdd(m, 1));
+  const top = sum.clients[0], topCat = sum.cats[0];
+  const lateP = pct(sum.late, sum.n);
+  const summary = sum.n
+    ? `En ${S.monthLabel(m)} se completaron <b>${pl(sum.n, 'tarea')}</b> para <b>${sum.clients.length} cliente${sum.clients.length === 1 ? '' : 's'}</b>. El cliente con más trabajo fue <b>${esc(top.name)}</b> con ${pl(top.n, 'tarea')} (${pct(top.n, sum.n)}%)${topCat ? `, y la categoría principal fue <b>${esc(topCat.name)}</b>` : ''}. El tiempo promedio de entrega, desde el ingreso hasta la finalización, fue de <b>${fmtDur(sum.avg)}</b>; ${sum.late ? `<b>${pl(sum.late, 'tarea')} (${lateP}%)</b> se terminaron después de su fecha límite` : 'todas se terminaron a tiempo'}. ${d.pending.length ? `${d.pending.length === 1 ? 'Quedó' : 'Quedaron'} <b>${pl(d.pending.length, 'tarea')} ${d.pending.length === 1 ? 'pendiente' : 'pendientes'}</b> que pasan a ${next}.` : 'No quedaron tareas pendientes.'}`
+    : `En ${S.monthLabel(m)} no se registraron tareas terminadas.`;
+  const done = [...d.done].sort((a, b) => (a.completedAt || '').localeCompare(b.completedAt || ''));
+  const dt = iso => { const x = new Date(iso); return `${x.getDate()}/${x.getMonth() + 1} ${fmtTime(x)}`; };
+  const dd = s => { if (!s) return '—'; const x = parseYmd(s); return `${x.getDate()}/${x.getMonth() + 1}`; };
+  const base = location.href.split('#')[0].replace(/[^/]*$/, '');
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Reporte de tareas · ${S.monthLabel(m)} · Vertikal</title>
+<base href="${base}">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+@page { size: letter; margin: 14mm 13mm 16mm; }
+* { box-sizing: border-box; }
+body { font-family: 'Inter', sans-serif; font-weight: 400; color: #111433; margin: 0; font-size: 10.5px; -webkit-print-color-adjust: exact; print-color-adjust: exact; background: #fff; }
+b, strong, th, h1, h2, h3 { font-weight: 700; }
+.bar { position: sticky; top: 0; background: #F7F8FC; border-bottom: 1px solid #E2E5F0; padding: 10px 16px; display: flex; gap: 10px; align-items: center; z-index: 5; }
+.bar button { font: inherit; font-weight: 700; font-size: 13px; border: 0; border-radius: 999px; padding: 9px 18px; background: #0065FF; color: #fff; cursor: pointer; }
+.bar span { color: #4A5070; font-size: 12px; }
+.page { max-width: 820px; margin: 0 auto; padding: 24px 16px; }
+header { display: flex; justify-content: space-between; align-items: flex-end; padding-bottom: 12px; }
+header img { height: 26px; }
+header .r { text-align: right; }
+header .r .k { font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: #747A99; font-weight: 600; }
+header .r h1 { margin: 2px 0 0; font-size: 20px; color: #000A4F; letter-spacing: -.02em; text-transform: capitalize; }
+.brandline { display: flex; height: 4px; border-radius: 2px; overflow: hidden; margin-bottom: 16px; }
+.brandline i { flex: 1; } .brandline i:nth-child(1) { background: #FF5A3C; } .brandline i:nth-child(2) { background: #0065FF; flex: 2; } .brandline i:nth-child(3) { background: #00B864; }
+.summary { background: #F1F3FA; border-radius: 12px; padding: 12px 14px; font-size: 11.5px; line-height: 1.6; margin-bottom: 14px; }
+.summary .k { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; color: #0057E0; font-weight: 700; margin-bottom: 4px; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+.kpi { border-radius: 12px; padding: 10px 12px; }
+.kpi .l { font-size: 9.5px; font-weight: 600; opacity: .85; }
+.kpi .v { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+.k1 { background: #000A4F; color: #fff; } .k2 { background: #DCE6FF; color: #001A55; } .k3 { background: #D6F5E5; color: #00502C; } .k4 { background: #FFE1DA; color: #5A1408; }
+h2 { font-size: 12px; color: #000A4F; margin: 18px 0 8px; letter-spacing: .02em; text-transform: uppercase; }
+table { width: 100%; border-collapse: collapse; }
+thead { display: table-header-group; }
+th { background: #000A4F; color: #fff; font-size: 9px; text-transform: uppercase; letter-spacing: .06em; text-align: left; padding: 6px 7px; }
+th:first-child { border-radius: 8px 0 0 8px; } th:last-child { border-radius: 0 8px 8px 0; }
+td { padding: 6px 7px; border-bottom: 1px solid #E8EBF5; vertical-align: top; }
+tr { page-break-inside: avoid; }
+tbody tr:nth-child(even) td { background: #F7F8FC; }
+.code { color: #747A99; font-weight: 600; white-space: nowrap; }
+.t { font-weight: 600; }
+.cl { white-space: nowrap; } .cl i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+.nw { white-space: nowrap; }
+.pill { display: inline-block; padding: 2px 7px; border-radius: 999px; font-weight: 700; font-size: 9px; white-space: nowrap; }
+.ok { background: #D6F5E5; color: #00804A; } .late { background: #FFE2DE; color: #C8261A; } .pend { background: #E8EBF5; color: #4A5070; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.share { display: inline-block; width: 70px; height: 6px; border-radius: 3px; background: #E8EBF5; vertical-align: middle; margin-right: 6px; overflow: hidden; } .share i { display: block; height: 100%; background: #0065FF; }
+.two { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; }
+footer { margin-top: 22px; padding-top: 10px; border-top: 1px solid #E2E5F0; display: flex; justify-content: space-between; color: #747A99; font-size: 9px; }
+@media print { .bar { display: none; } .page { padding: 0; max-width: none; } }
+</style></head><body>
+<div class="bar"><button onclick="window.print()">Guardar como PDF</button><span>En la ventana de impresión elige “Guardar como PDF”.</span></div>
+<div class="page">
+<header><img src="icons/logo.png" alt="Vertikal"><div class="r"><div class="k">Reporte mensual de tareas</div><h1>${S.monthLabel(m)}</h1></div></header>
+<div class="brandline"><i></i><i></i><i></i></div>
+<div class="summary"><div class="k">Resumen</div>${summary}</div>
+<div class="kpis">
+  <div class="kpi k1"><div class="l">Tareas terminadas</div><div class="v">${sum.n}</div></div>
+  <div class="kpi k2"><div class="l">Entrega promedio</div><div class="v">${fmtDur(sum.avg)}</div></div>
+  <div class="kpi k3"><div class="l">A tiempo</div><div class="v">${pct(sum.n - sum.late, sum.n)}%</div></div>
+  <div class="kpi k4"><div class="l">Pasan a ${esc(next.split(' ')[0])}</div><div class="v">${d.pending.length}</div></div>
+</div>
+<div class="two">
+<div><h2>Por cliente</h2><table><thead><tr><th>Cliente</th><th class="num">Tareas</th><th>Participación</th><th class="num">Prom.</th><th class="num">Tarde</th></tr></thead><tbody>
+${sum.clients.map(c => `<tr><td class="cl"><i style="background:${esc(c.color)}"></i>${esc(c.name)}</td><td class="num">${c.n}</td><td class="nw"><span class="share"><i style="width:${pct(c.n, sum.clients[0].n)}%"></i></span>${pct(c.n, sum.n)}%</td><td class="num nw">${fmtDur(c.avg)}</td><td class="num">${c.late}</td></tr>`).join('') || '<tr><td colspan="5">Sin datos</td></tr>'}
+</tbody></table></div>
+<div><h2>Por categoría</h2><table><thead><tr><th>Categoría</th><th class="num">Tareas</th><th class="num">%</th></tr></thead><tbody>
+${sum.cats.map(c => `<tr><td>${esc(c.name)}</td><td class="num">${c.n}</td><td class="num">${pct(c.n, sum.n)}%</td></tr>`).join('') || '<tr><td colspan="3">Sin datos</td></tr>'}
+</tbody></table></div>
+</div>
+<h2>Tareas terminadas · ${sum.n}</h2>
+<table><thead><tr><th>Código</th><th>Tarea</th><th>Cliente</th><th>Categoría</th><th>Ingresada</th><th>Límite</th><th>Finalizada</th><th>Estado</th></tr></thead><tbody>
+${done.map(t => `<tr><td class="code">${esc(t.code)}</td><td class="t">${esc(t.title)}</td><td class="cl"><i style="background:${esc(S.refClientColor(t))}"></i>${esc(S.refClientName(t))}</td><td>${esc(S.refCategoryName(t))}</td><td class="nw">${dt(t.createdAt)}</td><td class="nw">${dd(t.dueDate)}</td><td class="nw">${dt(t.completedAt)}</td><td>${S.wasLate(t) ? '<span class="pill late">Tarde</span>' : '<span class="pill ok">A tiempo</span>'}</td></tr>`).join('') || '<tr><td colspan="8">Sin tareas terminadas</td></tr>'}
+</tbody></table>
+${d.pending.length ? `<h2>Pendientes que pasan a ${next} · ${d.pending.length}</h2>
+<table><thead><tr><th>Código</th><th>Tarea</th><th>Cliente</th><th>Ingresada</th><th>Límite</th><th>Estado</th></tr></thead><tbody>
+${d.pending.map(t => `<tr><td class="code">${esc(t.code)}</td><td class="t">${esc(t.title)}</td><td class="cl"><i style="background:${esc(S.refClientColor(t))}"></i>${esc(S.refClientName(t))}</td><td class="nw">${dt(t.createdAt)}</td><td class="nw">${dd(t.dueDate)}</td><td><span class="pill pend">${STATUS[t.status]?.label || ''}</span></td></tr>`).join('')}
+</tbody></table>` : ''}
+<footer><span>Vertikal · Reporte generado el ${fmtDateTime(new Date().toISOString())}</span><span>${esc(CFG.USER_NAME || '')}</span></footer>
+</div>
+<script>document.fonts.ready.then(function(){ var im=document.querySelector('header img'); var go=function(){ setTimeout(function(){ window.print(); }, 350); }; if (im.complete) go(); else { im.onload=go; im.onerror=go; } });</script>
+</body></html>`;
+}
+
+function openReport(m, win) {
+  const d = monthData(m);
+  if (d.missing) { snack('Conecta Google para descargar este mes archivado'); win?.close(); return; }
+  win = win || window.open('', '_blank');
+  if (!win) { snack('Permite las ventanas emergentes para generar el PDF'); return; }
+  win.document.open(); win.document.write(reportHtml(m, d)); win.document.close();
+}
+
+// ---------------------------------------------------------------- exportar a Google Sheets (formato CM NOTES)
+async function sheetExport(m) {
+  if (!auth.linked) { snack('Conecta tu cuenta de Google para exportar a Sheets', 'Conectar', connect); return; }
+  const win = window.open('', '_blank');
+  try {
+    if (!auth.valid) await signIn(true);
+    const list = S.allKnownTasks().filter(t => S.taskMonth(t) === m).sort((a, b) => a.code.localeCompare(b.code));
+    const safe = v => /^[=+\-@]/.test(v || '') ? "'" + v : (v || '');
+    const dstr = iso => { const x = new Date(iso); return `${ymd(x)} ${String(x.getHours()).padStart(2, '0')}:${String(x.getMinutes()).padStart(2, '0')}:00`; };
+    const prio = t => t.status === 'done' ? 'Done' : ({ high: 'High', normal: 'Normal', low: 'Low' }[t.priority] || 'Normal');
+    const stat = t => ({ pending: 'Pending', progress: 'In progress', following: 'Following', done: 'Finished', inbox: 'Inbox' }[t.status] || '');
+    const header = ['COD', 'TASK', 'CLIENT', 'CATEGORY', 'PRIORITY', 'STATUS', 'DUE DATE', 'DELIVERY', 'NOTES', 'ASSIGNED', 'FINISHED AT'];
+    const rows = list.map(t => {
+      const l = (t.links || [])[0] || (t.files || [])[0];
+      const del = l ? `=HYPERLINK("${String(l.url).replace(/"/g, '%22')}","${String(l.title || l.name || 'Enlace').replace(/"/g, '""')}")` : '';
+      return [t.code, safe(t.title), S.refClientName(t), S.refCategoryName(t) === 'Sin categoría' ? '' : S.refCategoryName(t), prio(t), stat(t), t.dueDate || '', del, safe((t.notes || '').slice(0, 2000)), ymd(new Date(t.createdAt)), t.completedAt ? dstr(t.completedAt) : ''];
+    });
+    const names = arr => [...new Set(arr.filter(Boolean))].sort((a, b) => a.localeCompare(b, 'es'));
+    snack('Creando la hoja en tu Google Drive…');
+    const mon = ['ENE', 'FEB', 'MAR', 'ABR', 'MAY', 'JUN', 'JUL', 'AGO', 'SEP', 'OCT', 'NOV', 'DIC'][Number(m.slice(5, 7)) - 1];
+    const url = await exportToSheet({
+      title: `CM NOTES · ${S.monthLabel(m)}`, sheetTitle: `T - ${mon}`, header, rows,
+      validations: { CLIENT: names([...S.clients().map(c => c.name), ...rows.map(r => r[2])]), CATEGORY: names([...S.categories().map(c => c.name), ...rows.map(r => r[3])]), PRIORITY: ['High', 'Normal', 'Low', 'Done'], STATUS: ['Pending', 'In progress', 'Following', 'Finished', 'Inbox'] },
+      folderName: 'Vertikal CRM · Exportaciones'
+    });
+    if (win) win.location.href = url; else snack('Hoja creada', 'Abrir', () => window.open(url, '_blank'));
+    snack(`Hoja de ${S.monthLabel(m)} creada en Drive › Vertikal CRM · Exportaciones`);
+  } catch (e) {
+    win?.close();
+    snack(/sheets\.googleapis|disabled|has not been used/i.test(e.message) ? 'Falta habilitar la API de Google Sheets en el proyecto de Google Cloud' : 'No se pudo exportar: ' + e.message);
+  }
+}
+
+// ---------------------------------------------------------------- MI SEMANA
+const weekStartOf = d => { const x = new Date(d); x.setHours(0, 0, 0, 0); x.setDate(x.getDate() - (x.getDay() + 6) % 7); return ymd(x); };
+async function loadWeekEvents(ws) {
+  if (!auth.valid || ui.weekEvents[ws]?.loading) return;
+  ui.weekEvents[ws] = { loading: true, items: ui.weekEvents[ws]?.items || [] };
+  try { const min = parseYmd(ws); const items = await listEventsRange(min, addDays(min, 7)); ui.weekEvents[ws] = { items, at: Date.now() }; }
+  catch { ui.weekEvents[ws] = { items: [], at: Date.now(), err: true }; }
+  if (ui.route === 'week' && ui.weekStart === ws) { $('#view').innerHTML = viewWeek(); }
+}
+function weekCard(t) {
+  const done = t.status === 'done', over = S.isOverdue(t);
+  return `<div class="wcard ${done ? 'is-done' : ''} ${over ? 'is-over' : ''}" data-act="open" data-id="${t.id}" style="--c:${esc(cColor(t.clientId))}">
+    <span class="grip" data-ghost title="Arrastra a otro día">${icon('grip', 'sm')}</span>
+    <button class="check ${done ? 'on' : ''}" data-act="toggle" data-id="${t.id}" aria-label="Completar">${icon('check')}</button>
+    <div><div class="wt">${t.priority === 'high' ? `<span class="prio-high">${icon('flag', 'xs')}</span> ` : ''}${esc(t.title)}</div>
+    <div class="wm"><i class="cdot" style="background:${esc(cColor(t.clientId))}"></i>${esc(S.clientName(t.clientId))}${t.dueTime && !done ? ` · <span class="tm">${fmtHM(t.dueTime)}</span>` : ''}${done && t.completedAt ? ` · ${fmtTime(new Date(t.completedAt))}` : ''}${t.status === 'progress' ? ' · En desarrollo' : ''}</div></div></div>`;
+}
+function viewWeek() {
+  if (!ui.weekStart) ui.weekStart = weekStartOf(new Date());
+  const ws = ui.weekStart, start = parseYmd(ws);
+  const days = [...Array(7)].map((_, i) => ymd(addDays(start, i)));
+  const today = todayStr(), all = S.tasks();
+  const ev = ui.weekEvents[ws];
+  if (auth.valid && (!ev || (!ev.loading && Date.now() - (ev.at || 0) > 5 * 60e3))) loadWeekEvents(ws);
+  const older = all.filter(t => S.isOverdue(t) && t.dueDate < days[0]).sort(S.orderCmp);
+  const noDate = all.filter(t => S.isOpen(t) && !t.dueDate).sort(S.orderCmp);
+  const end = addDays(start, 6);
+  const range = start.getMonth() === end.getMonth() ? `${start.getDate()} al ${end.getDate()} de ${S.monthLabel(ym(end))}` : `${start.getDate()} ${shortMonth(ym(start))} al ${end.getDate()} ${shortMonth(ym(end))} ${end.getFullYear()}`;
+  const openWeek = all.filter(t => S.isOpen(t) && days.includes(t.dueDate)).length;
+  const doneWeek = all.filter(t => t.status === 'done' && t.completedAt && days.includes(ymd(new Date(t.completedAt)))).length;
+  const evFor = d => (ev?.items || []).filter(e => ymd(e.start.dateTime ? new Date(e.start.dateTime) : parseYmd(e.start.date)) === d);
+  return `<div class="week-h">
+    <h2>Semana del ${range}</h2>
+    <div class="seg"><button data-act="week-nav" data-v="-1" aria-label="Semana anterior">${icon('left', 'sm')}</button><button data-act="week-nav" data-v="0" class="${ws === weekStartOf(new Date()) ? 'on' : ''}">Hoy</button><button data-act="week-nav" data-v="1" aria-label="Semana siguiente">${icon('right', 'sm')}</button></div>
+    <span class="sp" style="flex:1"></span><span class="muted small">${openWeek} pendientes · ${doneWeek} terminadas</span>
+    <button class="btn outlined sm" data-act="meet-new">${icon('video', 'sm')}Reunión</button>
+  </div>
+  ${older.length ? `<div class="wstrip" data-drop-day="__keep"><h4 style="color:var(--error)">${icon('alert', 'sm')}Atrasadas de semanas anteriores · ${older.length}<span class="muted small" style="font-weight:400">Arrástralas a un día</span></h4><div class="list">${older.map(weekCard).join('')}</div></div>` : ''}
+  ${noDate.length ? `<div class="wstrip"><h4>${icon('clock', 'sm')}Sin fecha · ${noDate.length}<span class="muted small" style="font-weight:400">Arrástralas a un día para programarlas</span></h4><div class="list">${noDate.map(weekCard).join('')}</div></div>` : ''}
+  <div class="week">${days.map(d => {
+    const dt = parseYmd(d);
+    const list = all.filter(t => S.isOpen(t) && t.dueDate === d).sort(S.orderCmp);
+    const done = all.filter(t => S.doneOn(t, d)).sort((a, b) => a.completedAt.localeCompare(b.completedAt));
+    const evs = evFor(d);
+    return `<div class="wday ${d === today ? 'today' : ''} ${d < today ? 'past' : ''}" data-drop-day="${d}">
+      <div class="wday-h"><span class="n">${dt.getDate()}</span><b>${fmtLongDate(dt).split(' ')[0]}</b><span class="sp"></span><span class="count">${list.length}${done.length ? ' · ' + done.length + ' ✓' : ''}</span></div>
+      ${evs.map(e => `<a class="wev" href="${esc(e.htmlLink)}" target="_blank" rel="noopener"><time>${e.start.dateTime ? fmtTime(new Date(e.start.dateTime)) : 'Todo el día'}</time><b>${esc(e.summary || '(Sin título)')}</b></a>`).join('')}
+      ${list.map(weekCard).join('')}
+      ${done.map(weekCard).join('')}
+      <button class="wadd" data-act="new-on-day" data-d="${d}">${icon('plus', 'xs')} Tarea</button>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ---------------------------------------------------------------- ESTADÍSTICAS
+function statsRange(p) {
+  const now = new Date(); const cur = ym(now);
+  if (p === 'month') return { from: cur, to: cur, label: S.monthLabel(cur) };
+  if (p === 'prev') { const m = monthAdd(cur, -1); return { from: m, to: m, label: S.monthLabel(m) }; }
+  if (p === '3m') return { from: monthAdd(cur, -2), to: cur, label: 'Últimos 3 meses' };
+  if (p === 'year') return { from: `${now.getFullYear()}-01`, to: cur, label: String(now.getFullYear()) };
+  if (p === 'all') return { from: '0000-00', to: '9999-99', label: 'Todo el historial' };
+  const m = p.slice(2); return { from: m, to: m, label: S.monthLabel(m) };
+}
+function viewStats() {
+  const r = statsRange(ui.statsPeriod);
+  const all = S.allKnownTasks();
+  const inRange = iso => { const m = ym(new Date(iso)); return m >= r.from && m <= r.to; };
+  const done = all.filter(t => t.status === 'done' && t.completedAt && inRange(t.completedAt));
+  const sum = summarize(done);
+  const active = S.tasks();
+  const openBy = name => active.filter(t => S.isOpen(t) && S.clientName(t.clientId) === name);
+  const overNow = active.filter(t => S.isOverdue(t));
+  const top = sum.clients[0];
+  const lateTop = [...sum.clients].sort((a, b) => b.late - a.late)[0];
+  const missing = S.archivedMonths().filter(m => !S.getArchive(m));
+  const clientNames = new Set([...sum.clients.map(c => c.name), ...active.filter(S.isOpen).map(t => S.clientName(t.clientId))]);
+  const clientRows = [...clientNames].map(name => {
+    const c = sum.clients.find(x => x.name === name) || { name, n: 0, late: 0, avg: null, color: S.clients(true).find(x => x.name === name)?.color || '#5B6B8C' };
+    const o = openBy(name); return { ...c, open: o.length, overdue: o.filter(t => S.isOverdue(t)).length };
+  }).sort((a, b) => b.n - a.n || b.open - a.open);
+  const maxN = Math.max(1, ...clientRows.map(c => c.n));
+  const periods = [['month', 'Este mes'], ['prev', 'Mes anterior'], ['3m', 'Últimos 3 meses'], ['year', 'Este año'], ['all', 'Todo'], ...S.archivedMonths().map(m => ['m:' + m, S.monthLabel(m)])];
+  return `<div class="toolbar"><select class="select mini" style="width:auto" data-ch2="stats">${periods.map(([k, l]) => opt(k, l, ui.statsPeriod)).join('')}</select>
+    <span class="muted small">${r.label} · tareas terminadas en el periodo${missing.length ? ` · ${missing.length} mes(es) archivados se descargan al sincronizar` : ''}</span></div>
+  ${top ? `<div class="callout">${icon('chart')}<div>El cliente que más consume en ${r.label.toLowerCase().startsWith('todo') ? 'todo el historial' : r.label} es <b>${esc(top.name)}</b>: ${pl(top.n, 'tarea')} (${pct(top.n, sum.n)}%) con entrega promedio de ${fmtDur(top.avg)}.${lateTop && lateTop.late ? ` Más atrasos: <b>${esc(lateTop.name)}</b> (${lateTop.late}).` : ''}</div></div>` : ''}
+  <div class="stiles">
+    <div class="stile"><div class="lbl">Terminadas</div><div class="val">${sum.n}</div><div class="sub">${sum.clients.length} clientes · ${sum.cats.length} categorías</div></div>
+    <div class="stile"><div class="lbl">Entrega promedio</div><div class="val">${fmtDur(sum.avg)}</div><div class="sub">del ingreso a la finalización</div></div>
+    <div class="stile"><div class="lbl">A tiempo</div><div class="val">${sum.n ? pct(sum.n - sum.late, sum.n) + '%' : '—'}</div><div class="sub">${sum.n - sum.late} de ${sum.n}</div></div>
+    <div class="stile"><div class="lbl">Terminadas tarde</div><div class="val" style="color:var(--error)">${sum.late}</div><div class="sub">después de su fecha límite</div></div>
+    <div class="stile"><div class="lbl">Atrasadas hoy</div><div class="val">${overNow.length}</div><div class="sub">${active.filter(S.isOpen).length} abiertas en total</div></div>
+  </div>
+  <div class="grid dash">
+    <section class="card span-8"><div class="card-h"><h3>${icon('clients', 'sm')}Por cliente</h3></div><div class="table-wrap"><table class="stable">
+      <thead><tr><th>Cliente</th><th class="num">Terminadas</th><th>Participación</th><th class="num">Prom. entrega</th><th class="num">Tarde</th><th class="num">Abiertas</th><th class="num">Atrasadas hoy</th></tr></thead>
+      <tbody>${clientRows.map(c => `<tr><td><span class="cchip"><i class="cdot" style="background:${esc(c.color)}"></i>${esc(c.name)}</span></td><td class="num"><b>${c.n}</b></td>
+        <td><div class="share"><span class="track"><span class="fill" style="display:block;width:${c.n / maxN * 100}%"></span></span><span class="small">${pct(c.n, sum.n)}%</span></div></td>
+        <td class="num">${fmtDur(c.avg)}</td><td class="num ${c.late ? 'late' : ''}">${c.late}${c.n ? ` <span class="muted small">(${pct(c.late, c.n)}%)</span>` : ''}</td><td class="num">${c.open}</td><td class="num ${c.overdue ? 'late' : ''}">${c.overdue}</td></tr>`).join('') || `<tr><td colspan="7">${emptyBox('Sin datos en este periodo', 'chart')}</td></tr>`}</tbody></table></div></section>
+    <section class="card span-4"><div class="card-h"><h3>${icon('tasks', 'sm')}Por categoría</h3></div><div class="table-wrap"><table class="stable">
+      <thead><tr><th>Categoría</th><th class="num">Terminadas</th><th class="num">Prom.</th><th class="num">Tarde</th></tr></thead>
+      <tbody>${sum.cats.map(c => `<tr><td>${esc(c.name)}</td><td class="num"><b>${c.n}</b> <span class="muted small">${pct(c.n, sum.n)}%</span></td><td class="num">${fmtDur(c.avg)}</td><td class="num ${c.late ? 'late' : ''}">${c.late}</td></tr>`).join('') || `<tr><td colspan="4">${emptyBox('Sin datos', 'chart')}</td></tr>`}</tbody></table></div></section>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- arrastre con puntero (mouse y táctil)
+let pd = null;
+document.addEventListener('pointerdown', e => {
+  const g = e.target.closest('[data-grip],[data-ghost]'); if (!g || e.button > 0) return;
+  const item = g.closest('[data-id]'); if (!item) return;
+  e.preventDefault();
+  ui.suppressUntil = Date.now() + 10e3;
+  if (g.hasAttribute('data-grip')) {
+    const list = item.parentElement; if (!list?.hasAttribute('data-sort')) return;
+    pd = { mode: 'sort', item, list, moved: false };
+    item.classList.add('sorting');
+  } else {
+    const r = item.getBoundingClientRect();
+    const ghost = item.cloneNode(true); ghost.classList.add('ghost');
+    Object.assign(ghost.style, { width: r.width + 'px', left: r.left + 'px', top: r.top + 'px' });
+    document.body.appendChild(ghost);
+    pd = { mode: 'move', item, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, target: null };
+    item.classList.add('dragging');
+  }
+  try { g.setPointerCapture(e.pointerId); } catch {}
+});
+document.addEventListener('pointermove', e => {
+  if (!pd) return;
+  e.preventDefault();
+  if (e.clientY < 70) window.scrollBy(0, -14); else if (e.clientY > innerHeight - 90) window.scrollBy(0, 14);
+  if (pd.mode === 'sort') {
+    const sibs = [...pd.list.children].filter(c => c !== pd.item && c.dataset.id);
+    const before = sibs.find(c => { const r = c.getBoundingClientRect(); return e.clientY < r.top + r.height / 2; });
+    if (before) { if (pd.item.nextElementSibling !== before) { pd.list.insertBefore(pd.item, before); pd.moved = true; } }
+    else if (pd.list.lastElementChild !== pd.item) { pd.list.appendChild(pd.item); pd.moved = true; }
+  } else {
+    pd.ghost.style.left = (e.clientX - pd.dx) + 'px'; pd.ghost.style.top = (e.clientY - pd.dy) + 'px';
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const tgt = el?.closest('[data-drop],[data-drop-day]') || null;
+    if (tgt !== pd.target) { pd.target?.classList.remove('drop'); tgt?.classList.add('drop'); pd.target = tgt; }
+  }
+}, { passive: false });
+function endPointerDrag() {
+  if (!pd) return;
+  const d = pd; pd = null;
+  ui.suppressUntil = Date.now() + 350;
+  if (d.mode === 'sort') {
+    d.item.classList.remove('sorting');
+    if (d.moved) { S.setOrder([...d.list.children].map(c => c.dataset.id).filter(Boolean)); commit(); }
+    return;
+  }
+  d.ghost.remove(); d.item.classList.remove('dragging');
+  const t = d.target; t?.classList.remove('drop');
+  if (!t) return;
+  const id = d.item.dataset.id;
+  if (t.dataset.dropDay && t.dataset.dropDay !== '__keep') {
+    if (S.getTask(id)?.dueDate !== t.dataset.dropDay) { S.updateTask(id, { dueDate: t.dataset.dropDay }); commit(); snack(`Movida al ${fmtDate(t.dataset.dropDay)}`); }
+  } else if (t.dataset.drop) { S.updateTask(id, { status: t.dataset.drop }); commit(); }
+}
+document.addEventListener('pointerup', endPointerDrag);
+document.addEventListener('pointercancel', endPointerDrag);
+
+// ---------------------------------------------------------------- acciones y cambios nuevos
+Object.assign(ACTIONS, {
+  'archive-month': el => archiveDialog(el.dataset.m),
+  report: el => openReport(el.dataset.m),
+  'sheet-export': el => sheetExport(el.dataset.m),
+  'arch-open': el => { ui.openId = null; ui.archTask = { m: el.dataset.m, id: el.dataset.id }; renderArchSheet(); },
+  'arch-copy': el => {
+    const a = S.getArchive(el.dataset.m); const t = a?.tasks.find(x => x.id === el.dataset.id); if (!t) return;
+    const n = S.addTask({ title: t.title, clientId: S.getClient(t.clientId) ? t.clientId : null, categoryId: S.getCategory(t.categoryId) ? t.categoryId : null, priority: t.priority, status: 'pending', dueDate: todayStr(), notes: t.notes, links: structuredClone(t.links || []), logText: `Creada a partir de ${t.code} (archivo de ${S.monthLabel(el.dataset.m)})` });
+    n.subtasks = (t.subtasks || []).map(s => ({ ...s, id: uid(), done: false, doneAt: null }));
+    commit(); ui.archTask = null; openTask(n.id); snack(`Tarea ${n.code} creada a partir de ${t.code}`);
+  },
+  'week-nav': el => { const v = Number(el.dataset.v); ui.weekStart = v === 0 ? weekStartOf(new Date()) : ymd(addDays(parseYmd(ui.weekStart || weekStartOf(new Date())), 7 * v)); $('#view').innerHTML = viewWeek(); },
+  'new-on-day': el => taskDialog({ dueDate: el.dataset.d })
+});
+document.addEventListener('change', e => {
+  const el = e.target.closest('[data-ch2]'); if (!el) return;
+  if (el.dataset.ch2 === 'stats') { ui.statsPeriod = el.value; render(); }
+  if (el.dataset.ch2 === 'archf') { ui.archF[el.dataset.k] = el.value; render(); }
+});
+document.addEventListener('input', debounce(e => {
+  const el = e.target.closest?.('[data-ch2="archf"][data-k="q"]'); if (!el) return;
+  ui.archF.q = el.value; render();
+  const n = $('[data-ch2="archf"][data-k="q"]'); if (n) { n.focus(); n.setSelectionRange(n.value.length, n.value.length); }
+}, 250));
+
+
 // ---------------------------------------------------------------- arranque
 function boot() {
   applyTheme();
   store.load();
-  const rec = S.autoRecurring(); if (rec.n) store.persist(true);
+  const mig = S.migrateCodes();
+  const rec = S.autoRecurring();
+  const abs = S.absorbStragglers();
+  if (rec.n || mig || abs) store.persist(true);
   parseHash();
   render();
   if (rec.n) snack(`${rec.n} tareas recurrentes generadas`);

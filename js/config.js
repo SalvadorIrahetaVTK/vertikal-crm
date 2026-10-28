@@ -3,7 +3,7 @@
 // 2. Agrega la URL de GitHub Pages como "Origen de JavaScript autorizado".
 // Ver README.md, sección "Configurar Google Cloud".
 window.VK_CONFIG = {
-  GOOGLE_CLIENT_ID: '208723608234-8u731gaermp2tag27oscouqntef492rj.apps.googleusercontent.com',
+  GOOGLE_CLIENT_ID: '208723608234-8u731gaermp2tag27oscouqntef492rj.apps.googleusercontent.com', // ej. '1234567890-abc123.apps.googleusercontent.com'
   USER_NAME: 'Salvador',
   TIMEZONE: 'America/Guatemala',
   // Nombre de la lista de Google Tasks que verás en el widget de Android

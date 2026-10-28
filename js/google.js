@@ -193,3 +193,68 @@ export function createEvent({ title, description, start, end, attendees = [], me
   if (meet) body.conferenceData = { createRequest: { requestId: 'vk' + Date.now(), conferenceSolutionKey: { type: 'hangoutsMeet' } } };
   return api(`${CAL}/calendars/primary/events?conferenceDataVersion=1&sendUpdates=${attendees.length ? 'all' : 'none'}`, { method: 'POST', json: body });
 }
+
+// ---------- Drive: archivos mensuales (appDataFolder) ----------
+const archiveName = m => `vertikal-crm-archive-${m}.json`;
+export async function archiveSave(a) {
+  const json = JSON.stringify({ ...a, uploaded: true });
+  const q = encodeURIComponent(`name='${archiveName(a.month)}'`);
+  const r = await api(`${DRIVE}/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  const id = r.files?.[0]?.id;
+  if (id) return api(`${UPLOAD}/files/${id}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: json });
+  const { body, type } = multipartBody({ name: archiveName(a.month), parents: ['appDataFolder'] }, json, 'application/json');
+  return api(`${UPLOAD}/files?uploadType=multipart&fields=id`, { method: 'POST', headers: { 'Content-Type': type }, body });
+}
+export async function archiveLoad(month) {
+  const q = encodeURIComponent(`name='${archiveName(month)}'`);
+  const r = await api(`${DRIVE}/files?spaces=appDataFolder&q=${q}&fields=files(id)`);
+  const id = r.files?.[0]?.id;
+  return id ? api(`${DRIVE}/files/${id}?alt=media`) : null;
+}
+
+// ---------- Calendar por rango ----------
+export function listEventsRange(min, max) {
+  return api(`${CAL}/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=100&timeMin=${min.toISOString()}&timeMax=${max.toISOString()}`).then(r => r.items || []);
+}
+
+// ---------- Google Sheets: exportación en formato CM NOTES ----------
+const SHEETS = 'https://sheets.googleapis.com/v4/spreadsheets';
+export async function exportToSheet({ title, sheetTitle, header, rows, validations = {}, folderName }) {
+  const ss = await api(SHEETS, { method: 'POST', json: {
+    properties: { title, locale: 'en_US', timeZone: CFG.TIMEZONE || 'America/Guatemala' },
+    sheets: [{ properties: { title: sheetTitle, gridProperties: { frozenRowCount: 1, columnCount: header.length + 1, rowCount: Math.max(rows.length + 20, 60) } } }]
+  } });
+  const sid = ss.sheets[0].properties.sheetId;
+  const range = encodeURIComponent(`'${sheetTitle}'!B1`);
+  await api(`${SHEETS}/${ss.spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`, { method: 'PUT', json: { values: [header, ...rows] } });
+  const n = rows.length + 1, cols = header.length;
+  const col = name => header.indexOf(name) + 1;
+  const reqs = [
+    { repeatCell: { range: { sheetId: sid, startRowIndex: 0, endRowIndex: n, startColumnIndex: 1, endColumnIndex: cols + 1 }, cell: { userEnteredFormat: { textFormat: { fontFamily: 'Inter', fontSize: 10, foregroundColor: { red: 0.07, green: 0.08, blue: 0.2 } }, verticalAlignment: 'MIDDLE' } }, fields: 'userEnteredFormat(textFormat,verticalAlignment)' } },
+    { repeatCell: { range: { sheetId: sid, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 1, endColumnIndex: cols + 1 }, cell: { userEnteredFormat: { backgroundColor: { red: 0.643, green: 0.761, blue: 0.957 }, horizontalAlignment: 'CENTER', textFormat: { bold: true, fontFamily: 'Inter', fontSize: 10, foregroundColor: { red: 0.0, green: 0.12, blue: 0.55 } } } }, fields: 'userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)' } },
+    { updateDimensionProperties: { range: { sheetId: sid, dimension: 'COLUMNS', startIndex: 0, endIndex: 1 }, properties: { pixelSize: 24 }, fields: 'pixelSize' } },
+    { updateDimensionProperties: { range: { sheetId: sid, dimension: 'ROWS', startIndex: 0, endIndex: n }, properties: { pixelSize: 24 }, fields: 'pixelSize' } },
+    { setBasicFilter: { filter: { range: { sheetId: sid, startRowIndex: 0, endRowIndex: n, startColumnIndex: 1, endColumnIndex: cols + 1 } } } }
+  ];
+  const widths = { COD: 80, TASK: 320, CLIENT: 150, CATEGORY: 120, PRIORITY: 80, STATUS: 95, 'DUE DATE': 90, DELIVERY: 260, NOTES: 260, ASSIGNED: 90, 'FINISHED AT': 140 };
+  header.forEach((h, i) => widths[h] && reqs.push({ updateDimensionProperties: { range: { sheetId: sid, dimension: 'COLUMNS', startIndex: i + 1, endIndex: i + 2 }, properties: { pixelSize: widths[h] }, fields: 'pixelSize' } }));
+  for (const [name, values] of Object.entries(validations)) {
+    const c = col(name); if (!c || !values.length) continue;
+    reqs.push({ setDataValidation: { range: { sheetId: sid, startRowIndex: 1, endRowIndex: n, startColumnIndex: c, endColumnIndex: c + 1 }, rule: { condition: { type: 'ONE_OF_LIST', values: values.map(v => ({ userEnteredValue: v })) }, showCustomUi: true, strict: false } } });
+  }
+  for (const name of ['DUE DATE', 'ASSIGNED']) { const c = col(name); if (c) reqs.push({ repeatCell: { range: { sheetId: sid, startRowIndex: 1, endRowIndex: n, startColumnIndex: c, endColumnIndex: c + 1 }, cell: { userEnteredFormat: { numberFormat: { type: 'DATE', pattern: 'dd  ddd' }, horizontalAlignment: 'CENTER' } }, fields: 'userEnteredFormat(numberFormat,horizontalAlignment)' } }); }
+  const fc = col('FINISHED AT'); if (fc) reqs.push({ repeatCell: { range: { sheetId: sid, startRowIndex: 1, endRowIndex: n, startColumnIndex: fc, endColumnIndex: fc + 1 }, cell: { userEnteredFormat: { numberFormat: { type: 'DATE_TIME', pattern: 'dd mmm yyyy h:mm am/pm' } } }, fields: 'userEnteredFormat.numberFormat' } });
+  const sc = col('STATUS');
+  if (sc) {
+    const colors = { Finished: [0.85, 0.96, 0.89, 0.0, 0.45, 0.2], Following: [0.86, 0.9, 1, 0.0, 0.3, 0.8], Pending: [0.93, 0.94, 0.96, 0.3, 0.35, 0.45], 'In progress': [0.86, 0.9, 1, 0.0, 0.2, 0.7] };
+    Object.entries(colors).forEach(([v, c]) => reqs.push({ addConditionalFormatRule: { index: 0, rule: { ranges: [{ sheetId: sid, startRowIndex: 1, endRowIndex: n, startColumnIndex: sc, endColumnIndex: sc + 1 }], booleanRule: { condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: v }] }, format: { backgroundColor: { red: c[0], green: c[1], blue: c[2] }, textFormat: { bold: true, foregroundColor: { red: c[3], green: c[4], blue: c[5] } } } } } } }));
+  }
+  await api(`${SHEETS}/${ss.spreadsheetId}:batchUpdate`, { method: 'POST', json: { requests: reqs } });
+  if (folderName) {
+    try {
+      const folder = await findOrCreateFolder(folderName);
+      await api(`${DRIVE}/files/${ss.spreadsheetId}?addParents=${folder}&removeParents=root&fields=id`, { method: 'PATCH', json: {} });
+    } catch (e) { console.warn('No se pudo mover a la carpeta', e); }
+  }
+  return ss.spreadsheetUrl;
+}

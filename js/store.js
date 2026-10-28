@@ -22,7 +22,7 @@ function emptyState() {
   return {
     schema: 1, seq: 0, settingsUpdatedAt: 0,
     clients: [], categories: [], tasks: [], recurring: [], quick: [],
-    settings: { syncAheadDays: 0, notify: true, recurringGenerated: {}, gtListId: null }
+    settings: { syncAheadDays: 0, notify: true, recurringGenerated: {}, gtListId: null, archives: {}, monthSeq: {}, codeV2: false }
   };
 }
 
@@ -93,7 +93,7 @@ export function newTaskObj(p = {}) {
     createdAt: now(), startedAt: p.status === 'progress' ? now() : null, completedAt: p.status === 'done' ? now() : null,
     notes: p.notes || '', subtasks: [], links: p.links || [], files: [], log: [],
     source: p.source || 'manual', recurringId: p.recurringId || null,
-    gtaskId: null, gtStatus: null, deleted: false, updatedAt: Date.now()
+    gtaskId: null, gtStatus: null, rank: null, carriedFrom: null, deleted: false, updatedAt: Date.now()
   };
 }
 
@@ -140,6 +140,10 @@ export function mergeStates(a, b) {
   out.seq = Math.max(a.seq || 0, b.seq || 0);
   if ((b.settingsUpdatedAt || 0) > (a.settingsUpdatedAt || 0)) { out.settings = { ...a.settings, ...b.settings }; out.settingsUpdatedAt = b.settingsUpdatedAt; }
   out.settings.recurringGenerated = { ...(a.settings.recurringGenerated || {}), ...(b.settings?.recurringGenerated || {}) };
+  out.settings.archives = { ...(a.settings.archives || {}), ...(b.settings?.archives || {}) };
+  const seqA = a.settings.monthSeq || {}, seqB = b.settings?.monthSeq || {};
+  out.settings.monthSeq = Object.fromEntries([...new Set([...Object.keys(seqA), ...Object.keys(seqB)])].map(k => [k, Math.max(seqA[k] || 0, seqB[k] || 0)]));
+  out.settings.codeV2 = !!(a.settings.codeV2 || b.settings?.codeV2);
   return normalize(out);
 }
 export const sameData = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -175,8 +179,7 @@ export function addTask(p) {
   const t = newTaskObj(p);
   if (p.id) t.id = p.id;
   if (p.createdAt) t.createdAt = p.createdAt;
-  S().seq = (S().seq || 0) + 1;
-  t.code = 'T' + String(S().seq).padStart(3, '0');
+  t.code = nextCode(p.codeMonth || (p.source === 'recurring' && t.dueDate ? t.dueDate.slice(0, 7) : ym(new Date(t.createdAt))));
   log(t, p.logText || 'Tarea creada');
   if (p.gtaskId) { t.gtaskId = p.gtaskId; t.gtStatus = p.gtStatus || null; }
   S().tasks.push(t);
@@ -295,3 +298,134 @@ export function importSheetCSV(text, month) {
 export function overdueSnapshot() {
   return tasks().filter(isOpen).filter(t => t.dueDate).map(t => ({ id: t.id, title: `${t.title} · ${clientName(t.clientId)}`, dueMs: dueMs(t) }));
 }
+
+
+// ---------- Códigos por mes: T + MM + AA + consecutivo (T1026001) ----------
+export const codePrefix = month => 'T' + month.slice(5, 7) + month.slice(2, 4);
+export function codeMonth(code) {
+  const m = /^T(\d{2})(\d{2})\d{3,}$/.exec(code || '');
+  return m ? `20${m[2]}-${m[1]}` : null;
+}
+export function taskMonth(t) { return codeMonth(t.code) || (t.createdAt || '').slice(0, 7); }
+function maxSeq(month) {
+  const pre = codePrefix(month); let mx = S().settings.monthSeq?.[month] || 0;
+  for (const t of S().tasks) if (t.code && t.code.startsWith(pre)) mx = Math.max(mx, parseInt(t.code.slice(5), 10) || 0);
+  return mx;
+}
+export function nextCode(month) {
+  const n = maxSeq(month) + 1;
+  S().settings.monthSeq = { ...(S().settings.monthSeq || {}), [month]: n };
+  return codePrefix(month) + String(n).padStart(3, '0');
+}
+// Convierte los códigos antiguos (T001) al formato por mes, una sola vez
+export function migrateCodes() {
+  if (S().settings.codeV2) return false;
+  const list = S().tasks.filter(t => !t.deleted && !codeMonth(t.code)).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  for (const t of list) {
+    const month = t.source === 'recurring' && t.dueDate ? t.dueDate.slice(0, 7) : ym(new Date(t.createdAt));
+    t.code = nextCode(month); stamp(t);
+  }
+  S().settings.codeV2 = true; S().settingsUpdatedAt = Date.now();
+  return list.length > 0;
+}
+export const monthCount = month => S().settings.monthSeq?.[month] || 0;
+
+// ---------- Orden manual ----------
+export function orderCmp(a, b) {
+  const ra = a.rank ?? null, rb = b.rank ?? null;
+  if (ra !== null && rb !== null) return ra - rb;
+  if (ra !== null) return -1;
+  if (rb !== null) return 1;
+  return (dueMs(a) ?? 9e15) - (dueMs(b) ?? 9e15) || (a.priority === 'high' ? -1 : b.priority === 'high' ? 1 : 0) || a.createdAt.localeCompare(b.createdAt);
+}
+export function setOrder(ids) {
+  ids.forEach((id, i) => { const t = getTask(id); if (t && t.rank !== (i + 1) * 1000) { t.rank = (i + 1) * 1000; stamp(t); } });
+}
+
+// ---------- Archivo mensual ----------
+const AK = m => 'vkcrm.archive.' + m;
+export function getArchive(month) { try { return JSON.parse(localStorage.getItem(AK(month)) || 'null'); } catch { return null; } }
+export function saveArchive(a) { localStorage.setItem(AK(a.month), JSON.stringify(a)); }
+export const archivedMonths = () => Object.keys(S().settings.archives || {}).sort().reverse();
+export const isArchived = m => !!S().settings.archives?.[m];
+
+// Meses que ya pueden archivarse: desde su último día y hasta que se archiven
+export function archivableMonths(now = new Date()) {
+  const cur = ym(now);
+  const isLast = now.getDate() === lastDayOfMonth(now.getFullYear(), now.getMonth());
+  const months = new Set();
+  for (const t of tasks()) {
+    if (t.status === 'done' && t.completedAt) months.add(ym(new Date(t.completedAt)));
+    months.add(taskMonth(t));
+  }
+  return [...months].filter(m => m && !isArchived(m) && (m < cur || (m === cur && isLast))).sort();
+}
+
+export function archivePreview(month) {
+  const done = tasks().filter(t => t.status === 'done' && t.completedAt && ym(new Date(t.completedAt)) === month);
+  const pending = tasks().filter(t => t.status !== 'done' && taskMonth(t) <= month);
+  return { done, pending };
+}
+
+function snapshotRefs(list) {
+  const cl = {}, ca = {};
+  for (const t of list) {
+    if (t.clientId && !cl[t.clientId]) { const c = getClient(t.clientId); if (c) cl[t.clientId] = { name: c.name, color: c.color }; }
+    if (t.categoryId && !ca[t.categoryId]) { const c = getCategory(t.categoryId); if (c) ca[t.categoryId] = c.name; }
+  }
+  return { clients: cl, categories: ca };
+}
+
+export function archiveMonth(month) {
+  const { done, pending } = archivePreview(month);
+  const next = monthAdd(month, 1);
+  const tasksCopy = done.map(t => structuredClone(t));
+  const archive = {
+    month, archivedAt: now(), tasks: tasksCopy,
+    pending: pending.map(t => ({ id: t.id, code: t.code, title: t.title, clientId: t.clientId, categoryId: t.categoryId, status: t.status, dueDate: t.dueDate, createdAt: t.createdAt })),
+    ...snapshotRefs([...done, ...pending]), uploaded: false
+  };
+  saveArchive(archive);
+  for (const t of done) { const i = S().tasks.indexOf(t); S().tasks[i] = { id: t.id, deleted: true, archived: month, updatedAt: Date.now() }; }
+  for (const t of pending) {
+    if (t.carriedFrom !== month) { t.carriedFrom = month; log(t, `Pasó a ${monthLabel(next)} (pendiente al cerrar ${monthLabel(month)})`); stamp(t); }
+  }
+  S().settings.archives = { ...(S().settings.archives || {}), [month]: { count: tasksCopy.length, pending: pending.length, archivedAt: archive.archivedAt } };
+  S().settingsUpdatedAt = Date.now();
+  return archive;
+}
+
+// Tareas terminadas en un mes ya archivado (por ejemplo, completadas después de archivar): se agregan a ese archivo
+export function absorbStragglers() {
+  let n = 0;
+  for (const t of tasks()) {
+    if (t.status !== 'done' || !t.completedAt) continue;
+    const m = ym(new Date(t.completedAt));
+    if (!isArchived(m)) continue;
+    const a = getArchive(m); if (!a) continue;
+    a.tasks = a.tasks.filter(x => x.id !== t.id).concat(structuredClone(t));
+    const refs = snapshotRefs([t]);
+    a.clients = { ...a.clients, ...refs.clients }; a.categories = { ...a.categories, ...refs.categories };
+    a.uploaded = false; saveArchive(a);
+    const i = S().tasks.indexOf(t); S().tasks[i] = { id: t.id, deleted: true, archived: m, updatedAt: Date.now() };
+    S().settings.archives[m] = { ...S().settings.archives[m], count: a.tasks.length };
+    n++;
+  }
+  if (n) S().settingsUpdatedAt = Date.now();
+  return n;
+}
+const MESES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+export const monthLabel = m => { const [y, mm] = m.split('-').map(Number); return `${MESES[mm - 1]} ${y}`; };
+
+// ---------- Estadísticas ----------
+export function allKnownTasks() {
+  const map = new Map();
+  for (const m of archivedMonths()) { const a = getArchive(m); if (a) for (const t of a.tasks) map.set(t.id, { ...t, _archived: m, _refs: a }); }
+  for (const t of tasks()) map.set(t.id, t);
+  return [...map.values()];
+}
+export const refClientName = t => getClient(t.clientId)?.name || t._refs?.clients?.[t.clientId]?.name || 'Sin cliente';
+export const refClientColor = t => getClient(t.clientId)?.color || t._refs?.clients?.[t.clientId]?.color || '#5B6B8C';
+export const refCategoryName = t => getCategory(t.categoryId)?.name || t._refs?.categories?.[t.categoryId] || 'Sin categoría';
+export const deliveryMs = t => t.completedAt ? new Date(t.completedAt) - new Date(t.createdAt) : null;
+export const wasLate = t => !!(t.completedAt && t.dueDate && new Date(t.completedAt).getTime() > dueMs(t));

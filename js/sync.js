@@ -1,6 +1,6 @@
 // Sincronización: Drive (datos), Google Tasks (widget Android) y recurrentes
-import { store, mergeStates, autoRecurring, tasks, getTask, updateTask, addTask, addLog, setSetting, isOpen, doneOn, clientName, categoryName, clients, ensureCategory } from './store.js';
-import { auth, driveLoad, driveSave, ensureTaskList, listGTasks, insertGTask, patchGTask, deleteGTask } from './google.js';
+import { store, mergeStates, autoRecurring, tasks, getTask, updateTask, addTask, addLog, setSetting, isOpen, doneOn, clientName, categoryName, clients, ensureCategory, migrateCodes, absorbStragglers, archivedMonths, getArchive, saveArchive } from './store.js';
+import { auth, driveLoad, driveSave, ensureTaskList, listGTasks, insertGTask, patchGTask, deleteGTask, archiveSave, archiveLoad } from './google.js';
 import { todayStr, ymd, addDays } from './util.js';
 
 const CFG = window.VK_CONFIG || {};
@@ -20,8 +20,11 @@ export async function syncAll({ reason = '' } = {}) {
     store.dirty = false;
     const remote = await driveLoad();
     store.state = mergeStates(store.state, remote);
+    migrateCodes();
     const rec = autoRecurring();
+    absorbStragglers();
     await syncGTasks();
+    await syncArchives();
     const now = JSON.stringify(store.state);
     if (!remote || now !== JSON.stringify(remote)) await driveSave(store.state);
     store.persist(false);
@@ -130,4 +133,13 @@ let timer = null;
 export function scheduleSync(ms = 2500) {
   clearTimeout(timer);
   timer = setTimeout(() => syncAll({ reason: 'change' }), ms);
+}
+
+// Archivos mensuales: sube los nuevos y descarga los que falten en este dispositivo
+async function syncArchives() {
+  for (const m of archivedMonths()) {
+    const a = getArchive(m);
+    if (a && !a.uploaded) { await archiveSave(a); a.uploaded = true; saveArchive(a); }
+    else if (!a) { const r = await archiveLoad(m); if (r) saveArchive({ ...r, uploaded: true }); }
+  }
 }

@@ -1,5 +1,5 @@
 /* Vertikal CRM · Service Worker */
-const VERSION = 'vkcrm-v1.0.0';
+const VERSION = 'vkcrm-v2.0.0';
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest',
   './js/config.js', './js/app.js', './js/store.js', './js/google.js', './js/sync.js', './js/util.js',
@@ -23,7 +23,7 @@ self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET' || url.origin !== location.origin) return; // APIs de Google siempre en red
   // Red primero para que las actualizaciones lleguen rápido; caché como respaldo offline.
   e.respondWith(
-    fetch(e.request).then(res => {
+    fetch(e.request, { cache: 'no-cache' }).then(res => {
       const copy = res.clone();
       caches.open(VERSION).then(c => c.put(e.request, copy));
       return res;

@@ -106,3 +106,16 @@ icons/                Íconos generados a partir del logo de Vertikal
 Los íconos de la app se generaron desde el PNG del logo. Si tienes el isotipo en SVG o PNG grande, reemplaza `icons/icon-*.png`, `icons/maskable-*.png` y `icons/mark.png` para que se vean más nítidos.
 
 Para publicar una actualización, sube los archivos a GitHub y cambia `VERSION` en `sw.js` para que los teléfonos tomen la versión nueva.
+
+## Versión 2
+
+| Función | Cómo funciona |
+|---|---|
+| Códigos por mes | `T` + mes + año + consecutivo: **T1026001** es la tarea 1 creada en octubre 2026. El consecutivo indica cuántas tareas se crearon en el mes. Las recurrentes toman el mes en que vencen |
+| Archivo mensual | Desde el último día del mes aparece **Archivar mes** (en Inicio y en Archivo) y se queda visible hasta que lo archives. Guarda las tareas terminadas tal como están, en solo lectura, en tu Drive |
+| Pendientes | Al archivar, lo que no se terminó sigue activo y pasa al mes siguiente con la marca “De oct” |
+| Mi semana | Lunes a domingo con tus tareas y reuniones. Arrastra una tarea (ícono de puntos) a otro día para cambiar su fecha |
+| Orden manual | Arrastra el ícono de puntos en Inicio o en Tareas para definir qué trabajas primero. Las terminadas no se reordenan |
+| Estadísticas | Terminadas por cliente y categoría, entrega promedio, a tiempo y atrasadas, por mes o periodo |
+| PDF | Archivo › PDF abre el reporte con marca Vertikal; elige “Guardar como PDF” |
+| Sheets | Archivo › Sheets crea la hoja del mes en formato CM NOTES en Drive › Vertikal CRM · Exportaciones (requiere la API de Google Sheets habilitada en el proyecto) |
