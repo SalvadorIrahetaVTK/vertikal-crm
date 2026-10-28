@@ -1449,7 +1449,7 @@ document.addEventListener('pointerdown', e => {
     item.classList.add('sorting');
   } else {
     const r = item.getBoundingClientRect();
-    const ghost = item.cloneNode(true); ghost.classList.add('ghost');
+    const ghost = item.cloneNode(true); ghost.classList.add('drag-ghost');
     Object.assign(ghost.style, { width: r.width + 'px', left: r.left + 'px', top: r.top + 'px' });
     document.body.appendChild(ghost);
     pd = { mode: 'move', item, ghost, dx: e.clientX - r.left, dy: e.clientY - r.top, target: null };
