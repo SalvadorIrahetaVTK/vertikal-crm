@@ -1,5 +1,5 @@
 // Estado, persistencia local, fusión entre dispositivos y lógica de negocio
-import { uid, todayStr, ymd, ym, parseYmd, lastDayOfMonth, monthAdd, parseCSV, linkInfo } from './util.js';
+import { uid, todayStr, ymd, ym, parseYmd, addDays, lastDayOfMonth, monthAdd, parseCSV, linkInfo } from './util.js';
 
 const LS_KEY = 'vkcrm.data.v1';
 export const COLLECTIONS = ['clients', 'categories', 'tasks', 'recurring', 'quick'];
@@ -239,14 +239,14 @@ export function generateRecurring(month, { onlyTemplate = null, fromToday = fals
   const today = todayStr();
   let count = 0;
   for (const r of alive(S().recurring)) {
-    if (!r.active || (onlyTemplate && r.id !== onlyTemplate)) continue;
+    if (!r.active || (r.freq && r.freq !== 'monthly') || (onlyTemplate && r.id !== onlyTemplate)) continue;
     const days = [...new Set((r.days || []).map(d => d === 'L' ? last : Math.min(Number(d), last)))].filter(Boolean);
     for (const d of days) {
       const due = `${month}-${String(d).padStart(2, '0')}`;
-      if (fromToday && due < today) continue;
+      if ((fromToday && due < today) || (r.start && due < r.start) || (r.end && due > r.end)) continue;
       const id = `rec-${r.id}-${due}`; // id determinista: evita duplicados entre dispositivos
       if (S().tasks.some(t => t.id === id)) continue;
-      addTask({ id, title: r.title, clientId: r.clientId, categoryId: r.categoryId, priority: r.priority, status: 'pending', dueDate: due, dueTime: r.time || '', notes: r.notes || '', source: 'recurring', recurringId: r.id, logText: `Generada desde recurrentes (${month})` });
+      createFromTemplate(r, due, `Generada desde recurrentes (${month})`);
       count++;
     }
   }
@@ -259,6 +259,7 @@ export function autoRecurring() {
   let n = 0, months = [];
   if (!gen[cur]) { n += generateRecurring(cur, { fromToday: true }); months.push(cur); }
   if (d.getDate() === lastDayOfMonth(d.getFullYear(), d.getMonth()) && !gen[next]) { n += generateRecurring(next); months.push(next); }
+  n += generateRolling();
   return { n, months };
 }
 export function nextRecurringRun() {
@@ -429,3 +430,59 @@ export const refClientColor = t => getClient(t.clientId)?.color || t._refs?.clie
 export const refCategoryName = t => getCategory(t.categoryId)?.name || t._refs?.categories?.[t.categoryId] || 'Sin categoría';
 export const deliveryMs = t => t.completedAt ? new Date(t.completedAt) - new Date(t.createdAt) : null;
 export const wasLate = t => !!(t.completedAt && t.dueDate && new Date(t.completedAt).getTime() > dueMs(t));
+
+// ---------- Recurrentes v3: diaria, semanal y mensual con documentos ----------
+export const recFreq = r => r.freq || 'monthly';
+export function recMatches(r, ds) {
+  if (r.start && ds < r.start) return false;
+  if (r.end && ds > r.end) return false;
+  const d = parseYmd(ds); const f = recFreq(r);
+  if (f === 'daily') return r.dailyMode !== 'weekdays' || (d.getDay() !== 0 && d.getDay() !== 6);
+  if (f === 'weekly') return (r.weekdays || []).includes(((d.getDay() + 6) % 7) + 1);
+  const last = lastDayOfMonth(d.getFullYear(), d.getMonth());
+  return (r.days || []).some(x => (x === 'L' ? last : Math.min(Number(x), last)) === d.getDate());
+}
+export function createFromTemplate(r, due, logText) {
+  const id = `rec-${r.id}-${due}`;
+  if (S().tasks.some(t => t.id === id)) return null;
+  const t = addTask({ id, title: r.title, clientId: r.clientId, categoryId: r.categoryId, priority: r.priority, status: 'pending', dueDate: due, dueTime: r.time || '', notes: r.notes || '', source: 'recurring', recurringId: r.id, logText, links: (r.links || []).map(l => ({ ...l, id: uid() })) });
+  t.files = (r.files || []).map(f => ({ ...f, id: uid() }));
+  t.subtasks = (r.subtasks || []).map(s => ({ id: uid(), title: s.title, done: false, createdAt: now(), doneAt: null }));
+  return t;
+}
+export const ROLL_DAYS = 7;
+// Diarias y semanales: se generan con una semana de anticipación
+export function generateRolling(onlyTemplate = null) {
+  let n = 0;
+  for (const r of alive(S().recurring)) {
+    if (!r.active || recFreq(r) === 'monthly' || (onlyTemplate && r.id !== onlyTemplate)) continue;
+    for (let i = 0; i <= ROLL_DAYS; i++) {
+      const ds = ymd(addDays(new Date(), i));
+      if (recMatches(r, ds) && createFromTemplate(r, ds, 'Generada desde recurrentes')) n++;
+    }
+  }
+  return n;
+}
+// Al guardar o activar una plantilla: crea de inmediato lo que toca desde hoy
+export function activateTemplate(r) {
+  if (!r.active) return 0;
+  if (recFreq(r) !== 'monthly') return generateRolling(r.id);
+  const cur = ym(new Date()); const gen = S().settings.recurringGenerated || {};
+  let n = 0;
+  for (const m of [cur, monthAdd(cur, 1)]) if (m === cur || gen[m]) n += generateRecurring(m, { onlyTemplate: r.id, fromToday: true });
+  return n;
+}
+export const recIsOver = r => !!(r.end && r.end < todayStr());
+export const recOpenTasks = id => tasks().filter(t => t.recurringId === id && t.status !== 'done');
+export function applyTemplateToOpen(r) {
+  const list = recOpenTasks(r.id);
+  for (const t of list) {
+    Object.assign(t, { title: r.title, clientId: r.clientId, categoryId: r.categoryId, priority: r.priority, notes: r.notes || '', dueTime: r.time || '' });
+    for (const l of r.links || []) if (!t.links.some(x => x.url === l.url)) t.links.push({ ...l, id: uid() });
+    for (const f of r.files || []) if (!t.files.some(x => x.driveId === f.driveId)) t.files.push({ ...f, id: uid() });
+    for (const s of r.subtasks || []) if (!t.subtasks.some(x => x.title === s.title)) t.subtasks.push({ id: uid(), title: s.title, done: false, createdAt: now(), doneAt: null });
+    log(t, 'Actualizada desde su plantilla recurrente'); stamp(t);
+  }
+  return list.length;
+}
+
